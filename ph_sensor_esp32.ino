@@ -3,6 +3,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
+#include <SEN0161.h>
 
 // Конфигурация WiFi
 const char* AP_SSID = "WaterSensor";
@@ -16,20 +17,37 @@ const char* MQTT_PASSWORD = "";
 const int phPin = 34;    // GPIO34 для pH датчика
 const int orpPin = 35;   // GPIO35 для ORP датчика
 
+// Создание объекта для pH датчика
+SEN0161 phSensor(phPin);
+
+// Константы для расчетов
+#define VCC 3.3          // Напряжение питания ESP32
+#define OFFSET 0         // Смещение для ORP (калибруется)
+#define PH_OFFSET 0      // Смещение для pH (калибруется)
+#define PH_SCALE 1.0     // Множитель для pH (калибруется)
+#define ORP_SCALE 1.0    // Множитель для ORP (калибруется)
+
+// Массивы для усреднения значений
+#define ARRAY_LENGTH 40
+int phArray[ARRAY_LENGTH];
+int orpArray[ARRAY_LENGTH];
+int phArrayIndex = 0;
+int orpArrayIndex = 0;
+
 // Калибровочные значения
 struct Calibration {
-  float phCalibration = 0.0;
-  float phScale = 1.0;
-  float orpCalibration = 0.0;
-  float orpScale = 1.0;
+  float phOffset = PH_OFFSET;
+  float phScale = PH_SCALE;
+  float orpOffset = OFFSET;
+  float orpScale = ORP_SCALE;
 };
 
 // Значения с датчиков
 struct SensorValues {
   float phValue = 0.0;
-  float phVoltage = 0.0;
   float orpValue = 0.0;
-  float orpVoltage = 0.0;
+  float phRaw = 0.0;
+  float orpRaw = 0.0;
 };
 
 // Объекты для работы с сетью
@@ -62,8 +80,10 @@ const char* index_html = R"rawliteral(
     body { font-family: Arial; text-align: center; margin: 0px auto; padding: 20px; }
     .card { background-color: #f1f1f1; padding: 20px; margin: 10px; border-radius: 10px; }
     .value { font-size: 48px; font-weight: bold; }
+    .raw-value { font-size: 24px; color: #666; }
     .button { background-color: #4CAF50; border: none; color: white; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 5px; }
     .sensor { margin-bottom: 20px; }
+    .calibration { margin-top: 10px; }
   </style>
 </head>
 <body>
@@ -73,17 +93,23 @@ const char* index_html = R"rawliteral(
     <div class="sensor">
       <h2>pH Sensor</h2>
       <div class="value" id="phValue">--</div>
-      <div>Калибровка:</div>
-      <input type="number" id="phCalibration" step="0.1" placeholder="Смещение">
-      <input type="number" id="phScale" step="0.1" placeholder="Множитель">
+      <div class="raw-value">Сырое значение: <span id="phRaw">--</span></div>
+      <div class="calibration">
+        <div>Калибровка:</div>
+        <input type="number" id="phCalibration" step="0.1" placeholder="Смещение">
+        <input type="number" id="phScale" step="0.1" placeholder="Множитель">
+      </div>
     </div>
     
     <div class="sensor">
       <h2>ORP Sensor</h2>
       <div class="value" id="orpValue">--</div>
-      <div>Калибровка:</div>
-      <input type="number" id="orpCalibration" step="0.1" placeholder="Смещение">
-      <input type="number" id="orpScale" step="0.1" placeholder="Множитель">
+      <div class="raw-value">Сырое значение: <span id="orpRaw">--</span></div>
+      <div class="calibration">
+        <div>Калибровка:</div>
+        <input type="number" id="orpCalibration" step="0.1" placeholder="Смещение">
+        <input type="number" id="orpScale" step="0.1" placeholder="Множитель">
+      </div>
     </div>
     
     <button class="button" onclick="saveCalibration()">Сохранить калибровку</button>
@@ -95,7 +121,9 @@ const char* index_html = R"rawliteral(
         .then(response => response.json())
         .then(data => {
           document.getElementById('phValue').innerHTML = data.ph.toFixed(2);
+          document.getElementById('phRaw').innerHTML = data.ph_raw;
           document.getElementById('orpValue').innerHTML = data.orp.toFixed(0) + ' mV';
+          document.getElementById('orpRaw').innerHTML = data.orp_raw;
         });
     }
     setInterval(updateValues, 5000);
@@ -170,20 +198,31 @@ void setup() {
 void loop() {
   server.handleClient();
   
-  // Чтение и обработка данных с датчиков
-  int phSensorValue = analogRead(phPin);
-  int orpSensorValue = analogRead(orpPin);
+  // Чтение pH
+  phArray[phArrayIndex++] = analogRead(phPin);
+  if (phArrayIndex == ARRAY_LENGTH) {
+    phArrayIndex = 0;
+  }
+  float phAvg = averageArray(phArray, ARRAY_LENGTH);
+  sensorValues.phRaw = phAvg;
   
-  // Преобразование в напряжение
-  sensorValues.phVoltage = phSensorValue * (3.3 / 4095.0);
-  sensorValues.orpVoltage = orpSensorValue * (3.3 / 4095.0);
+  // Расчет pH (формула из документации Seeed Studio)
+  // E = 59.16 (mV/pH)
+  float phVoltage = phAvg * (VCC / 4095.0);  // Преобразование в напряжение
+  sensorValues.phValue = 7.0 - ((phVoltage - 2.5) / 0.18);  // Базовая формула
+  sensorValues.phValue = (sensorValues.phValue + settings.calibration.phOffset) * settings.calibration.phScale;
   
-  // Расчет значений с учетом калибровки
-  sensorValues.phValue = (7.0 + ((2.5 - sensorValues.phVoltage) / 0.18) + 
-                         settings.calibration.phCalibration) * settings.calibration.phScale;
+  // Чтение ORP
+  orpArray[orpArrayIndex++] = analogRead(orpPin);
+  if (orpArrayIndex == ARRAY_LENGTH) {
+    orpArrayIndex = 0;
+  }
+  float orpAvg = averageArray(orpArray, ARRAY_LENGTH);
+  sensorValues.orpRaw = orpAvg;
   
-  // Расчет ORP (примерная формула, может потребовать корректировки)
-  sensorValues.orpValue = (sensorValues.orpVoltage * 1000) + settings.calibration.orpCalibration;
+  // Расчет ORP (формула из документации Seeed Studio)
+  // ORP = ((30 * Vcc * 1000) - (75 * avg * Vcc * 1000/1024))/75 - OFFSET
+  sensorValues.orpValue = ((30 * VCC * 1000) - (75 * orpAvg * VCC * 1000/4095))/75 - settings.calibration.orpOffset;
   sensorValues.orpValue *= settings.calibration.orpScale;
   
   // Отправка данных в MQTT
@@ -191,6 +230,8 @@ void loop() {
     StaticJsonDocument<200> doc;
     doc["ph"] = sensorValues.phValue;
     doc["orp"] = sensorValues.orpValue;
+    doc["ph_raw"] = sensorValues.phRaw;
+    doc["orp_raw"] = sensorValues.orpRaw;
     String output;
     serializeJson(doc, output);
     mqttClient.publish("homeassistant/sensor/water_sensor/state", output.c_str());
@@ -198,7 +239,7 @@ void loop() {
     mqttConnect();
   }
   
-  delay(5000);  // Обновление каждые 5 секунд
+  delay(20);  // Интервал между измерениями 20мс
 }
 
 void setupWiFi() {
@@ -264,4 +305,17 @@ void loadSettings() {
 void saveSettings() {
   EEPROM.put(0, settings);
   EEPROM.commit();
+}
+
+// Функция для усреднения массива значений
+float averageArray(int* arr, int number) {
+  if (number <= 0) {
+    return 0;
+  }
+  
+  float sum = 0;
+  for (int i = 0; i < number; i++) {
+    sum += arr[i];
+  }
+  return sum / number;
 } 
