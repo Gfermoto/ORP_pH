@@ -4,6 +4,16 @@
 #include <ArduinoJson.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
+#include "esp_mac.h"
+#include "version.h"
+
+// Константы для настроек по умолчанию
+const char* DEFAULT_SSID = "ORP_pH_AP";
+const char* DEFAULT_PASSWORD = "12345678";
+const char* DEFAULT_MQTT_SERVER = "192.168.1.100";
+const int DEFAULT_MQTT_PORT = 1883;
+const char* DEFAULT_MQTT_USER = "";
+const char* DEFAULT_MQTT_PASSWORD = "";
 
 // Конфигурация WiFi
 const char* AP_SSID = "WaterSensor";
@@ -23,17 +33,13 @@ const int orpPin = 35;   // GPIO35 для ORP датчика
 const int ledPin = 2;    // GPIO2 для светодиода
 const int bootButton = 0; // Кнопка BOOT
 
-// Константы для расчетов
-#define VCC 3.3          // Напряжение питания ESP32
-#define OFFSET 256       // Смещение для ORP (калибруется)
-#define PH_OFFSET 0      // Смещение для pH (калибруется)
-#define PH_SCALE 1.0     // Множитель для pH (калибруется)
-#define ORP_SCALE 1.0    // Множитель для ORP (калибруется)
-
-// Настройки по умолчанию
-#define DEFAULT_UPDATE_INTERVAL 5000  // Интервал обновления в мс
-#define DEFAULT_DEVICE_NAME "WaterSensor"
-#define BOOT_HOLD_TIME 3000 // Время удержания кнопки в мс
+// Настройки устройства по умолчанию
+#define DEFAULT_UPDATE_INTERVAL 5000  // Интервал обновления датчиков в мс (5 секунд)
+#define DEBOUNCE_DELAY 50
+#define BOOT_HOLD_TIME_WIFI_RESET 3000
+#define BOOT_HOLD_TIME_FACTORY_RESET 10000
+#define WIFI_CONNECT_TIMEOUT 5000 // Уменьшаем таймаут до 5 секунд
+#define WIFI_RECONNECT_ATTEMPTS 3 // Количество попыток подключения
 
 // Массивы для усреднения значений
 #define ARRAY_LENGTH 40
@@ -42,22 +48,24 @@ int orpArray[ARRAY_LENGTH];
 int phArrayIndex = 0;
 int orpArrayIndex = 0;
 
-// Константы для светодиода
-#define LED_BLINK_INTERVAL 1000  // Интервал мигания в мс
-unsigned long lastLedBlink = 0;
-bool ledState = false;
+// Константы для расчетов и калибровки по умолчанию
+#define VCC 3.3             // Напряжение питания ESP32 (важно для АЦП)
+#define DEFAULT_ORP_OFFSET 0.0 // Смещение для ORP (калибруется) - уточнено
+#define DEFAULT_PH_OFFSET 0.0  // Смещение для pH (калибруется)
+#define DEFAULT_PH_SCALE 1.0   // Множитель для pH (калибруется)
+#define DEFAULT_ORP_SCALE 1.0  // Множитель для ORP (калибруется)
 
 // Калибровочные значения
 struct Calibration {
-  float phOffset = PH_OFFSET;
-  float phScale = PH_SCALE;
-  float orpOffset = OFFSET;
-  float orpScale = ORP_SCALE;
+  float phOffset = DEFAULT_PH_OFFSET;
+  float phScale = DEFAULT_PH_SCALE;
+  float orpOffset = DEFAULT_ORP_OFFSET;
+  float orpScale = DEFAULT_ORP_SCALE;
 };
 
 // Значения с датчиков
 struct SensorValues {
-  float phValue = 0.0;
+  float phValue = 7.0; // Начальные значения
   float orpValue = 0.0;
   float phRaw = 0.0;
   float orpRaw = 0.0;
@@ -68,7 +76,7 @@ WebServer server(80);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// Структура для хранения настроек
+// Структура для хранения настроек в EEPROM
 struct Settings {
   char deviceName[32];
   char wifiSSID[32];
@@ -79,1100 +87,1012 @@ struct Settings {
   char mqttPassword[64];
   int updateInterval;
   Calibration calibration;
+  uint16_t settingsVersion; // Добавим версию для проверки
 };
-
 Settings settings;
+const uint16_t CURRENT_SETTINGS_VERSION = 0x01; // Версия структуры настроек
+
 SensorValues sensorValues;
 
-// Таймеры
+// Таймеры и флаги
 unsigned long lastSensorRead = 0;
-unsigned long bootButtonPressTime = 0;
-bool bootButtonPressed = false;
+unsigned long lastMQTTReconnectAttempt = 0;
+const long MQTT_RECONNECT_INTERVAL = 5000; // Интервал попыток переподключения MQTT
 
-// HTML страницы
-const char* index_html = R"rawliteral(
-<!DOCTYPE HTML>
-<html>
-<head>
-  <title>Water Quality Sensor</title>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-  <style>
-    :root {
-      --primary-color: #2196F3;
-      --secondary-color: #1976D2;
-      --background-color: #f5f5f5;
-      --card-color: #ffffff;
-      --text-color: #333333;
-      --border-radius: 8px;
-      --box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-
-    body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background-color: var(--background-color);
-      color: var(--text-color);
-      line-height: 1.6;
-      padding: 20px;
-    }
-
-    .container {
-      max-width: 800px;
-      margin: 0 auto;
-    }
-
-    .header {
-      text-align: center;
-      margin-bottom: 30px;
-    }
-
-    .header h1 {
-      color: var(--primary-color);
-      margin-bottom: 10px;
-    }
-
-    .card {
-      background-color: var(--card-color);
-      border-radius: var(--border-radius);
-      box-shadow: var(--box-shadow);
-      padding: 20px;
-      margin-bottom: 20px;
-    }
-
-    .sensor {
-      margin-bottom: 20px;
-      padding: 15px;
-      border-radius: var(--border-radius);
-      background-color: var(--background-color);
-    }
-
-    .sensor h2 {
-      color: var(--primary-color);
-      margin-bottom: 10px;
-    }
-
-    .value {
-      font-size: 36px;
-      font-weight: bold;
-      color: var(--primary-color);
-      margin: 10px 0;
-    }
-
-    .raw-value {
-      font-size: 14px;
-      color: #666;
-      margin-bottom: 10px;
-    }
-
-    .calibration {
-      margin-top: 15px;
-      padding-top: 15px;
-      border-top: 1px solid #eee;
-    }
-
-    .calibration label {
-      display: block;
-      margin-bottom: 5px;
-      color: #666;
-    }
-
-    .calibration input {
-      width: 100%;
-      padding: 8px;
-      margin-bottom: 10px;
-      border: 1px solid #ddd;
-      border-radius: 4px;
-    }
-
-    .button {
-      background-color: var(--primary-color);
-      color: white;
-      border: none;
-      padding: 12px 24px;
-      border-radius: var(--border-radius);
-      cursor: pointer;
-      font-size: 16px;
-      transition: background-color 0.3s;
-      width: 100%;
-    }
-
-    .button:hover {
-      background-color: var(--secondary-color);
-    }
-
-    .status {
-      text-align: center;
-      margin-top: 20px;
-      padding: 10px;
-      border-radius: var(--border-radius);
-      background-color: #e8f5e9;
-      color: #2e7d32;
-    }
-
-    .tabs {
-      display: flex;
-      margin-bottom: 20px;
-      border-bottom: 1px solid #ddd;
-    }
-
-    .tab {
-      padding: 10px 20px;
-      cursor: pointer;
-      border: none;
-      background: none;
-      color: #666;
-    }
-
-    .tab.active {
-      color: var(--primary-color);
-      border-bottom: 2px solid var(--primary-color);
-    }
-
-    .tab-content {
-      display: none;
-    }
-
-    .tab-content.active {
-      display: block;
-    }
-
-    .checkbox-container {
-      margin: 10px 0;
-      display: flex;
-      align-items: center;
-    }
-    
-    .checkbox-container input[type="checkbox"] {
-      margin-right: 10px;
-    }
-
-    @media (max-width: 600px) {
-      .container {
-        padding: 10px;
-      }
-      
-      .value {
-        font-size: 28px;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>Water Quality Sensor</h1>
-      <p>Мониторинг качества воды в реальном времени</p>
-    </div>
-
-    <div class="tabs">
-      <button class="tab active" onclick="showTab('readings')">Показания</button>
-      <button class="tab" onclick="showTab('settings')">Настройки</button>
-      <button class="tab" onclick="showTab('about')">О проекте</button>
-    </div>
-    
-    <div id="readings" class="tab-content active">
-      <div class="card">
-        <div class="sensor">
-          <h2>pH Sensor</h2>
-          <div class="value" id="phValue">--</div>
-          <div class="raw-value">Сырое значение: <span id="phRaw">--</span></div>
-          <div class="calibration">
-            <label>Калибровка pH</label>
-            <input type="number" id="phCalibration" step="0.1" placeholder="Смещение">
-            <input type="number" id="phScale" step="0.1" placeholder="Множитель">
-            <div class="checkbox-container">
-              <input type="checkbox" id="resetPhCalibration">
-              <label for="resetPhCalibration">Сбросить калибровку pH</label>
-            </div>
-          </div>
-        </div>
-        
-        <div class="sensor">
-          <h2>ORP Sensor</h2>
-          <div class="value" id="orpValue">--</div>
-          <div class="raw-value">Сырое значение: <span id="orpRaw">--</span></div>
-          <div class="calibration">
-            <label>Калибровка ORP</label>
-            <input type="number" id="orpCalibration" step="0.1" placeholder="Смещение">
-            <input type="number" id="orpScale" step="0.1" placeholder="Множитель">
-            <div class="checkbox-container">
-              <input type="checkbox" id="resetOrpCalibration">
-              <label for="resetOrpCalibration">Сбросить калибровку ORP</label>
-            </div>
-          </div>
-        </div>
-        
-        <button class="button" onclick="saveCalibration()">Сохранить калибровку</button>
-        <div id="status" class="status" style="display: none;"></div>
-      </div>
-    </div>
-
-    <div id="settings" class="tab-content">
-      <div class="card">
-        <h2>Настройки устройства</h2>
-        <div class="calibration">
-          <label>Имя устройства</label>
-          <input type="text" id="deviceName" placeholder="Имя устройства">
-          
-          <label>Интервал обновления (мс)</label>
-          <input type="number" id="updateInterval" placeholder="Интервал обновления">
-        </div>
-
-        <h2>Настройки WiFi</h2>
-        <div class="calibration">
-          <label>SSID</label>
-          <input type="text" id="wifiSSID" placeholder="SSID">
-          
-          <label>Пароль</label>
-          <input type="password" id="wifiPassword" placeholder="Пароль">
-        </div>
-
-        <h2>Настройки MQTT</h2>
-        <div class="calibration">
-          <label>Сервер</label>
-          <input type="text" id="mqttServer" placeholder="MQTT сервер">
-          
-          <label>Порт</label>
-          <input type="number" id="mqttPort" placeholder="Порт">
-          
-          <label>Пользователь</label>
-          <input type="text" id="mqttUser" placeholder="Пользователь">
-          
-          <label>Пароль</label>
-          <input type="password" id="mqttPassword" placeholder="Пароль">
-        </div>
-        
-        <button class="button" onclick="saveSettings()">Сохранить настройки</button>
-        <div id="settingsStatus" class="status" style="display: none;"></div>
-      </div>
-    </div>
-
-    <div id="about" class="tab-content">
-      <div class="card">
-        <h2>О проекте</h2>
-        <p>Система мониторинга качества воды в бассейне с использованием ESP32 и датчиков pH/ORP.</p>
-        
-        <h3>Основные функции:</h3>
-        <ul>
-          <li>Измерение pH и ORP в реальном времени</li>
-          <li>Калибровка датчиков через веб-интерфейс</li>
-          <li>Интеграция с Home Assistant через MQTT</li>
-          <li>OTA обновление прошивки</li>
-          <li>Настраиваемый интервал обновления</li>
-          <li>Управление светодиодом</li>
-        </ul>
-
-        <h3>Технические характеристики:</h3>
-        <ul>
-          <li>ESP32-WROOM-32</li>
-          <li>pH датчик: 0-14 pH</li>
-          <li>ORP датчик: -2000 до 2000 mV</li>
-          <li>WiFi: 802.11 b/g/n</li>
-          <li>Питание: 5V USB</li>
-        </ul>
-
-        <h3>OTA Обновление</h3>
-        <p>Для обновления прошивки по воздуху:</p>
-        <form method='POST' action='/update' enctype='multipart/form-data'>
-          <input type='file' name='update'>
-          <button class="button" type='submit'>Загрузить прошивку</button>
-        </form>
-        <p><strong>Важно:</strong></p>
-        <ul>
-          <li>Не отключайте питание во время обновления</li>
-          <li>Дождитесь перезагрузки устройства</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-  
-  <script>
-    function showTab(tabName) {
-      // Скрыть все вкладки
-      document.querySelectorAll('.tab-content').forEach(tab => {
-        tab.classList.remove('active');
-      });
-      document.querySelectorAll('.tab').forEach(tab => {
-        tab.classList.remove('active');
-      });
-      
-      // Показать выбранную вкладку
-      document.getElementById(tabName).classList.add('active');
-      document.querySelector(`.tab[onclick="showTab('${tabName}')"]`).classList.add('active');
-    }
-
-    function updateValues() {
-      fetch('/data')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('phValue').innerHTML = data.ph.toFixed(2);
-          document.getElementById('phRaw').innerHTML = data.ph_raw;
-          document.getElementById('orpValue').innerHTML = data.orp.toFixed(0) + ' mV';
-          document.getElementById('orpRaw').innerHTML = data.orp_raw;
-        })
-        .catch(error => {
-          console.error('Error:', error);
-        });
-    }
-
-    function showStatus(message, isError = false) {
-      const status = document.getElementById('status');
-      status.textContent = message;
-      status.style.display = 'block';
-      status.style.backgroundColor = isError ? '#ffebee' : '#e8f5e9';
-      status.style.color = isError ? '#c62828' : '#2e7d32';
-      setTimeout(() => {
-        status.style.display = 'none';
-      }, 3000);
-    }
-
-    function saveCalibration() {
-      const phCalibration = document.getElementById('phCalibration').value;
-      const phScale = document.getElementById('phScale').value;
-      const orpCalibration = document.getElementById('orpCalibration').value;
-      const orpScale = document.getElementById('orpScale').value;
-      const resetPh = document.getElementById('resetPhCalibration').checked;
-      const resetOrp = document.getElementById('resetOrpCalibration').checked;
-      
-      fetch('/calibrate?phCalibration=' + phCalibration + 
-            '&phScale=' + phScale + 
-            '&orpCalibration=' + orpCalibration + 
-            '&orpScale=' + orpScale +
-            '&resetPh=' + resetPh +
-            '&resetOrp=' + resetOrp)
-        .then(response => response.text())
-        .then(data => {
-          showStatus(data);
-          updateValues();
-          // Сбрасываем чекбоксы после сохранения
-          document.getElementById('resetPhCalibration').checked = false;
-          document.getElementById('resetOrpCalibration').checked = false;
-        })
-        .catch(error => {
-          showStatus('Ошибка при сохранении калибровки', true);
-          console.error('Error:', error);
-        });
-    }
-
-    function saveSettings() {
-      const settings = {
-        deviceName: document.getElementById('deviceName').value,
-        updateInterval: document.getElementById('updateInterval').value,
-        wifiSSID: document.getElementById('wifiSSID').value,
-        wifiPassword: document.getElementById('wifiPassword').value,
-        mqttServer: document.getElementById('mqttServer').value,
-        mqttPort: document.getElementById('mqttPort').value,
-        mqttUser: document.getElementById('mqttUser').value,
-        mqttPassword: document.getElementById('mqttPassword').value
-      };
-
-      fetch('/settings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(settings)
-      })
-      .then(response => response.text())
-      .then(data => {
-        const status = document.getElementById('settingsStatus');
-        status.textContent = data;
-        status.style.display = 'block';
-        setTimeout(() => {
-          status.style.display = 'none';
-        }, 3000);
-      })
-      .catch(error => {
-        console.error('Error:', error);
-      });
-    }
-
-    // Загрузка текущих настроек при открытии страницы
-    fetch('/settings')
-      .then(response => response.json())
-      .then(data => {
-        document.getElementById('deviceName').value = data.deviceName;
-        document.getElementById('updateInterval').value = data.updateInterval;
-        document.getElementById('wifiSSID').value = data.wifiSSID;
-        document.getElementById('wifiPassword').value = data.wifiPassword;
-        document.getElementById('mqttServer').value = data.mqttServer;
-        document.getElementById('mqttPort').value = data.mqttPort;
-        document.getElementById('mqttUser').value = data.mqttUser;
-        document.getElementById('mqttPassword').value = data.mqttPassword;
-      });
-
-    setInterval(updateValues, 5000);
-    updateValues();
-  </script>
-</body>
-</html>
-)rawliteral";
-
-// В HTML странице калибровки исправляем отображение
-const char* calibration_html = R"rawliteral(
-<!DOCTYPE HTML>
-<html>
-<head>
-  <title>Калибровка датчиков</title>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      margin: 0;
-      padding: 20px;
-      background-color: #f5f5f5;
-    }
-    .container {
-      max-width: 600px;
-      margin: 0 auto;
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .sensor {
-      margin-bottom: 20px;
-      padding: 15px;
-      border-radius: 8px;
-      background-color: #f8f9fa;
-    }
-    .sensor h2 {
-      color: #2196F3;
-      margin-bottom: 10px;
-    }
-    .current-values {
-      background-color: #e8f5e9;
-      padding: 10px;
-      border-radius: 4px;
-      margin-bottom: 15px;
-    }
-    .calibration {
-      margin-top: 15px;
-    }
-    .calibration label {
-      display: block;
-      margin-bottom: 5px;
-      color: #666;
-    }
-    .calibration input {
-      width: 100%;
-      padding: 8px;
-      margin-bottom: 10px;
-      border: 1px solid #ddd;
-      border-radius: 4px;
-    }
-    .button {
-      background-color: #2196F3;
-      color: white;
-      border: none;
-      padding: 12px 24px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 16px;
-      margin-top: 10px;
-    }
-    .button:hover {
-      background-color: #1976D2;
-    }
-    .reset-section {
-      margin-top: 30px;
-      padding-top: 20px;
-      border-top: 1px solid #ddd;
-    }
-    .reset-button {
-      background-color: #f44336;
-      color: white;
-      border: none;
-      padding: 12px 24px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 16px;
-    }
-    .reset-button:hover {
-      background-color: #d32f2f;
-    }
-    .status {
-      margin-top: 15px;
-      padding: 10px;
-      border-radius: 4px;
-      display: none;
-    }
-    .success {
-      background-color: #e8f5e9;
-      color: #2e7d32;
-    }
-    .error {
-      background-color: #ffebee;
-      color: #c62828;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Калибровка датчиков</h1>
-    
-    <div class="sensor">
-      <h2>pH Датчик</h2>
-      <div class="current-values">
-        <p>Текущее значение: <span id="currentPh">--</span></p>
-        <p>Текущая калибровка:</p>
-        <p>Смещение: <span id="currentPhOffset">--</span></p>
-        <p>Множитель: <span id="currentPhScale">--</span></p>
-      </div>
-      <div class="calibration">
-        <label>Смещение pH:</label>
-        <input type="number" id="phCalibration" step="0.1" placeholder="Смещение">
-        <label>Множитель pH:</label>
-        <input type="number" id="phScale" step="0.1" placeholder="Множитель">
-      </div>
-    </div>
-    
-    <div class="sensor">
-      <h2>ORP Датчик</h2>
-      <div class="current-values">
-        <p>Текущее значение: <span id="currentOrp">--</span> mV</p>
-        <p>Текущая калибровка:</p>
-        <p>Смещение: <span id="currentOrpOffset">--</span></p>
-        <p>Множитель: <span id="currentOrpScale">--</span></p>
-      </div>
-      <div class="calibration">
-        <label>Смещение ORP:</label>
-        <input type="number" id="orpCalibration" step="0.1" placeholder="Смещение">
-        <label>Множитель ORP:</label>
-        <input type="number" id="orpScale" step="0.1" placeholder="Множитель">
-      </div>
-    </div>
-    
-    <button class="button" onclick="saveCalibration()">Сохранить калибровку</button>
-    <div id="status" class="status"></div>
-    
-    <div class="reset-section">
-      <h3>Сброс калибровки</h3>
-      <p>Эта операция сбросит все значения калибровки на значения по умолчанию:</p>
-      <ul>
-        <li>Смещение pH: 0.0</li>
-        <li>Множитель pH: 1.0</li>
-        <li>Смещение ORP: 256.0</li>
-        <li>Множитель ORP: 1.0</li>
-      </ul>
-      <button class="reset-button" onclick="resetCalibration()">Сбросить калибровку</button>
-    </div>
-  </div>
-  
-  <script>
-    function updateValues() {
-      fetch('/data')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('currentPh').innerHTML = data.ph.toFixed(2);
-          document.getElementById('currentOrp').innerHTML = data.orp.toFixed(0);
-        });
-      
-      fetch('/calibration')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('currentPhOffset').innerHTML = data.phOffset.toFixed(1);
-          document.getElementById('currentPhScale').innerHTML = data.phScale.toFixed(1);
-          document.getElementById('currentOrpOffset').innerHTML = data.orpOffset.toFixed(1);
-          document.getElementById('currentOrpScale').innerHTML = data.orpScale.toFixed(1);
-          
-          document.getElementById('phCalibration').value = data.phOffset;
-          document.getElementById('phScale').value = data.phScale;
-          document.getElementById('orpCalibration').value = data.orpOffset;
-          document.getElementById('orpScale').value = data.orpScale;
-        });
-    }
-    
-    function showStatus(message, isError = false) {
-      const status = document.getElementById('status');
-      status.textContent = message;
-      status.style.display = 'block';
-      status.className = 'status ' + (isError ? 'error' : 'success');
-      setTimeout(() => {
-        status.style.display = 'none';
-      }, 3000);
-    }
-    
-    function saveCalibration() {
-      const phCalibration = document.getElementById('phCalibration').value;
-      const phScale = document.getElementById('phScale').value;
-      const orpCalibration = document.getElementById('orpCalibration').value;
-      const orpScale = document.getElementById('orpScale').value;
-      
-      fetch('/calibrate?phCalibration=' + phCalibration + 
-            '&phScale=' + phScale + 
-            '&orpCalibration=' + orpCalibration + 
-            '&orpScale=' + orpScale)
-        .then(response => response.text())
-        .then(data => {
-          showStatus(data);
-          updateValues();
-        })
-        .catch(error => {
-          showStatus('Ошибка при сохранении калибровки', true);
-          console.error('Error:', error);
-        });
-    }
-    
-    function resetCalibration() {
-      if (confirm('Вы уверены, что хотите сбросить все значения калибровки?')) {
-        fetch('/calibrate?reset=true')
-          .then(response => response.text())
-          .then(data => {
-            showStatus(data);
-            updateValues();
-          })
-          .catch(error => {
-            showStatus('Ошибка при сбросе калибровки', true);
-            console.error('Error:', error);
-          });
-      }
-    }
-    
-    setInterval(updateValues, 5000);
-    updateValues();
-  </script>
-</body>
-</html>
-)rawliteral";
+// --- Прототипы функций ---
+void loadSettings();
+void saveSettings();
+void setupWiFi();
+bool setupMQTT();
+void resetWiFi();
+void factoryReset();
+String getDeviceName();
+void handleRoot();
+void handleSettings();
+void handleCalibration();
+void handleAbout();
+void handleUpdateFirmware();
+void handleDoUpdate();
+void handleNotFound();
+String getNavigationMenu(String activePage);
+String getCSS();
+void readSensors();
+void publishSensorData();
+// --------------------------
 
 void setup() {
   Serial.begin(115200);
+  Serial.println(F("\n\nBooting ORP/pH Sensor..."));
+
   pinMode(bootButton, INPUT_PULLUP);
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
+
+  // Проверка кнопки BOOT с антидребезгом
+  unsigned long pressStartTime = 0;
+  bool resetTriggered = false;
   
-  // Проверяем состояние кнопки BOOT при старте
   if (digitalRead(bootButton) == LOW) {
-    bootButtonPressTime = millis();
-    bootButtonPressed = true;
-    
-    while(digitalRead(bootButton) == LOW && (millis() - bootButtonPressTime < BOOT_HOLD_TIME)) {
-      delay(100);
-      digitalWrite(ledPin, !digitalRead(ledPin));
-    }
-    
-    if(digitalRead(bootButton) == LOW) {
-      resetWiFi();
-      return;
+    delay(DEBOUNCE_DELAY); // Антидребезг
+    if (digitalRead(bootButton) == LOW) { // Проверяем, что кнопка все еще нажата
+      pressStartTime = millis();
+      Serial.println(F("BOOT button held... Detecting hold duration."));
+      
+      // Индикация нажатия кнопки
+      for(int i = 0; i < 3; i++) {
+        digitalWrite(ledPin, HIGH);
+        delay(100);
+        digitalWrite(ledPin, LOW);
+        delay(100);
+      }
+      
+      while (digitalRead(bootButton) == LOW) {
+        unsigned long holdTime = millis() - pressStartTime;
+        
+        // Индикация длительности нажатия
+        if (holdTime % 1000 < 100) {
+          digitalWrite(ledPin, HIGH);
+        } else {
+          digitalWrite(ledPin, LOW);
+        }
+        
+        if (holdTime > BOOT_HOLD_TIME_FACTORY_RESET) {
+          Serial.println(F("Factory reset triggered"));
+          resetTriggered = true;
+          factoryReset();
+          break;
+        } else if (holdTime > BOOT_HOLD_TIME_WIFI_RESET) {
+          Serial.println(F("WiFi reset triggered"));
+          resetTriggered = true;
+          resetWiFi();
+          break;
+        }
+        delay(50);
+      }
     }
   }
-  
-  loadSettings();
-  setupWiFi();
-  setupMQTT();
-  
-  // Настройка OTA
-  ArduinoOTA.setHostname(settings.deviceName);
-  ArduinoOTA.setPassword("12345678");
-  
-  ArduinoOTA.onStart([]() {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else {
-      type = "filesystem";
-    }
-    Serial.println("Start updating " + type);
-    for(int i = 0; i < 3; i++) {
-      digitalWrite(ledPin, HIGH);
-      delay(100);
-      digitalWrite(ledPin, LOW);
-      delay(100);
-    }
-  });
-  
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    digitalWrite(ledPin, !digitalRead(ledPin));
-  });
-  
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
-    for(int i = 0; i < 3; i++) {
-      digitalWrite(ledPin, HIGH);
-      delay(100);
-      digitalWrite(ledPin, LOW);
-      delay(100);
-    }
-  });
-  
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    for(int i = 0; i < 3; i++) {
-      digitalWrite(ledPin, HIGH);
-      delay(500);
-      digitalWrite(ledPin, LOW);
-      delay(500);
-    }
-  });
-  
-  ArduinoOTA.begin();
-  
-  // Настройка веб-сервера
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/html", index_html);
-  });
-  
-  server.on("/data", HTTP_GET, []() {
-    StaticJsonDocument<200> doc;
-    doc["ph"] = sensorValues.phValue;
-    doc["orp"] = sensorValues.orpValue;
-    doc["ph_raw"] = sensorValues.phRaw;
-    doc["orp_raw"] = sensorValues.orpRaw;
-    String output;
-    serializeJson(doc, output);
-    server.send(200, "application/json", output);
-  });
-  
-  server.on("/settings", HTTP_GET, []() {
-    StaticJsonDocument<512> doc;
-    doc["deviceName"] = settings.deviceName;
-    doc["updateInterval"] = settings.updateInterval;
-    doc["wifiSSID"] = settings.wifiSSID;
-    doc["wifiPassword"] = settings.wifiPassword;
-    doc["mqttServer"] = settings.mqttServer;
-    doc["mqttPort"] = settings.mqttPort;
-    doc["mqttUser"] = settings.mqttUser;
-    doc["mqttPassword"] = settings.mqttPassword;
-    String output;
-    serializeJson(doc, output);
-    server.send(200, "application/json", output);
-  });
-  
-  server.on("/settings", HTTP_POST, []() {
-    if (server.hasArg("plain")) {
-      StaticJsonDocument<512> doc;
-      DeserializationError error = deserializeJson(doc, server.arg("plain"));
-      
-      if (!error) {
-        // Сохраняем настройки устройства
-        if (doc.containsKey("deviceName")) {
-          strlcpy(settings.deviceName, doc["deviceName"], sizeof(settings.deviceName));
-        }
-        
-        if (doc.containsKey("updateInterval")) {
-          settings.updateInterval = doc["updateInterval"];
-        }
-        
-        // Сохраняем настройки WiFi
-        if (doc.containsKey("wifiSSID")) {
-          strlcpy(settings.wifiSSID, doc["wifiSSID"], sizeof(settings.wifiSSID));
-        }
-        
-        if (doc.containsKey("wifiPassword")) {
-          strlcpy(settings.wifiPassword, doc["wifiPassword"], sizeof(settings.wifiPassword));
-        }
-        
-        // Сохраняем настройки MQTT
-        if (doc.containsKey("mqttServer")) {
-          strlcpy(settings.mqttServer, doc["mqttServer"], sizeof(settings.mqttServer));
-        }
-        
-        if (doc.containsKey("mqttPort")) {
-          settings.mqttPort = doc["mqttPort"];
-        }
-        
-        if (doc.containsKey("mqttUser")) {
-          strlcpy(settings.mqttUser, doc["mqttUser"], sizeof(settings.mqttUser));
-        }
-        
-        if (doc.containsKey("mqttPassword")) {
-          strlcpy(settings.mqttPassword, doc["mqttPassword"], sizeof(settings.mqttPassword));
-        }
-        
-        saveSettings();
-        server.send(200, "text/plain", "Настройки сохранены");
-        
-        // Перезагружаем WiFi если изменились настройки сети
-        if (doc.containsKey("wifiSSID") || doc.containsKey("wifiPassword")) {
-          WiFi.disconnect();
-          setupWiFi();
-        }
-        
-        // Перезагружаем MQTT если изменились настройки
-        if (doc.containsKey("mqttServer") || doc.containsKey("mqttPort") || 
-            doc.containsKey("mqttUser") || doc.containsKey("mqttPassword")) {
-          mqttClient.disconnect();
-          setupMQTT();
-        }
-      } else {
-        server.send(400, "text/plain", "Ошибка при разборе JSON");
-      }
-    } else {
-      server.send(400, "text/plain", "Отсутствует тело запроса");
-    }
-  });
-  
-  server.on("/calibration", HTTP_GET, []() {
-    server.send(200, "text/html", calibration_html);
-  });
 
-  server.on("/calibration", HTTP_GET, []() {
-    StaticJsonDocument<200> doc;
-    doc["phOffset"] = settings.calibration.phOffset;
-    doc["phScale"] = settings.calibration.phScale;
-    doc["orpOffset"] = settings.calibration.orpOffset;
-    doc["orpScale"] = settings.calibration.orpScale;
-    String output;
-    serializeJson(doc, output);
-    server.send(200, "application/json", output);
-  });
+  // Инициализация и основная логика setup только если не было сброса
+  if (!resetTriggered) {
+    Serial.println(F("Proceeding with normal boot sequence."));
+    EEPROM.begin(sizeof(Settings)); // Размер структуры Settings
+    loadSettings(); // Загружаем настройки (могут быть дефолтные)
+    // EEPROM.end(); // Закроем после всех операций в setup, если нужно
 
-  server.on("/calibrate", HTTP_GET, []() {
-    if (server.hasArg("reset") && server.arg("reset") == "true") {
-      settings.calibration.phOffset = PH_OFFSET;
-      settings.calibration.phScale = PH_SCALE;
-      settings.calibration.orpOffset = OFFSET;
-      settings.calibration.orpScale = ORP_SCALE;
-      saveSettings();
-      server.send(200, "text/plain", "Калибровка сброшена");
-      return;
-    }
-    
-    if (server.hasArg("phCalibration") && server.hasArg("phScale") &&
-        server.hasArg("orpCalibration") && server.hasArg("orpScale")) {
-      
-      settings.calibration.phOffset = server.arg("phCalibration").toFloat();
-      settings.calibration.phScale = server.arg("phScale").toFloat();
-      settings.calibration.orpOffset = server.arg("orpCalibration").toFloat();
-      settings.calibration.orpScale = server.arg("orpScale").toFloat();
-      
-      saveSettings();
-      server.send(200, "text/plain", "Калибровка сохранена");
+    setupWiFi(); // Настраиваем WiFi
+    setupMQTT(); // Настраиваем MQTT
+
+    // --- Настройка OTA ---
+    ArduinoOTA.setHostname(settings.deviceName);
+    // ArduinoOTA.setPassword("ваш_пароль_ота"); // Раскомментируйте, если нужен пароль
+    ArduinoOTA.onStart([]() {
+      String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+      Serial.println("Start updating " + type);
+      mqttClient.disconnect();
+      server.stop(); // Останавливаем веб-сервер перед OTA
+      for(int i = 0; i < 3; i++) { digitalWrite(ledPin, HIGH); delay(50); digitalWrite(ledPin, LOW); delay(50); }
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+      digitalWrite(ledPin, !digitalRead(ledPin));
+    });
+    ArduinoOTA.onEnd([]() {
+      Serial.println("\nEnd");
+      for(int i = 0; i < 3; i++) { digitalWrite(ledPin, HIGH); delay(100); digitalWrite(ledPin, LOW); delay(100); }
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println(F("Auth Failed"));
+      else if (error == OTA_BEGIN_ERROR) Serial.println(F("Begin Failed"));
+      else if (error == OTA_CONNECT_ERROR) Serial.println(F("Connect Failed"));
+      else if (error == OTA_RECEIVE_ERROR) Serial.println(F("Receive Failed"));
+      else if (error == OTA_END_ERROR) Serial.println(F("End Failed"));
+      for(int i = 0; i < 5; i++) { digitalWrite(ledPin, HIGH); delay(200); digitalWrite(ledPin, LOW); delay(200); }
+      ESP.restart();
+    });
+    ArduinoOTA.begin();
+    Serial.println(F("OTA Ready"));
+    Serial.printf("OTA Hostname: %s\n", settings.deviceName);
+
+    // --- Настройка WebServer ---
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/settings", HTTP_GET, handleSettings);
+    server.on("/settings", HTTP_POST, handleSettings);
+    server.on("/calibration", HTTP_GET, handleCalibration);
+    server.on("/calibration", HTTP_POST, handleCalibration);
+    server.on("/about", HTTP_GET, handleAbout);
+    // Обработчики для OTA через веб-интерфейс
+    server.on("/update", HTTP_GET, handleUpdateFirmware); // Страница для загрузки
+    server.on("/doUpdate", HTTP_POST, handleDoUpdate, []() { // Обработка загрузки файла
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.printf("Update: %s\n", upload.filename.c_str());
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { // Автоопределение размера
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) { // true to set the size to the current progress
+                Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+            } else {
+                Update.printError(Serial);
+            }
+        } else {
+             Serial.printf("Update Failed Unexpectedly (likely broken connection): Status = %d\n", upload.status);
+              Update.abort(); // Прерываем обновление если что-то пошло не так
+        }
+    });
+    server.onNotFound(handleNotFound); // Обработчик 404
+    server.begin();
+    Serial.println(F("HTTP server started"));
+    if (WiFi.getMode() == WIFI_AP) {
+        Serial.printf("Access AP at SSID: %s\n", settings.deviceName);
+        Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
     } else {
-      server.send(400, "text/plain", "Ошибка: не указаны параметры калибровки");
+         // Создаем hostname для mDNS
+         String hostname = String(settings.deviceName);
+         hostname.toLowerCase(); // mDNS лучше с lowercase
+         hostname.replace("_", "-");
+         Serial.printf("Access Web UI via http://%s.local or http://%s\n", hostname.c_str(), WiFi.localIP().toString().c_str());
     }
-  });
-  
-  // Добавляем обработчик для загрузки прошивки
-  server.on("/update", HTTP_POST, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
-    ESP.restart();
-  }, []() {
-    HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) {
-      Serial.printf("Update: %s\n", upload.filename.c_str());
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-        Update.printError(Serial);
-      }
-    } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Update.printError(Serial);
-      }
-    } else if (upload.status == UPLOAD_FILE_END) {
-      if (Update.end(true)) {
-        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
-      } else {
-        Update.printError(Serial);
-      }
-    }
-  });
-  
-  server.begin();
+  } else {
+    Serial.println(F("Reset was triggered, halting normal boot. Should have restarted already."));
+    while(true) { delay(1000); } // Остановка
+  }
 }
 
 void loop() {
-  // Проверяем состояние кнопки BOOT
-  if (digitalRead(bootButton) == LOW) {
-    if (!bootButtonPressed) {
-      bootButtonPressTime = millis();
-      bootButtonPressed = true;
-      digitalWrite(ledPin, HIGH);
-    } else if (millis() - bootButtonPressTime > BOOT_HOLD_TIME) {
-      resetWiFi();
-      return;
-    }
-  } else {
-    if (bootButtonPressed) {
-      bootButtonPressed = false;
-      digitalWrite(ledPin, WiFi.getMode() == WIFI_AP);
+  ArduinoOTA.handle(); // Обработка OTA запросов
+  server.handleClient(); // Обработка HTTP запросов
+
+  // Переподключение MQTT при разрыве
+  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
+    unsigned long now = millis();
+    if (now - lastMQTTReconnectAttempt > MQTT_RECONNECT_INTERVAL) {
+      lastMQTTReconnectAttempt = now;
+      if (setupMQTT()) { // setupMQTT возвращает true при успехе
+        lastMQTTReconnectAttempt = 0; // Сбрасываем таймер при успехе
+      }
     }
   }
-  
-  ArduinoOTA.handle();
-  server.handleClient();
-  
-  // Чтение данных с датчиков
-  if (millis() - lastSensorRead > settings.updateInterval) {
+    mqttClient.loop(); // Поддержание MQTT соединения и обработка входящих сообщений (если есть подписки)
+
+  // Чтение данных с датчиков и отправка MQTT
+  if (millis() - lastSensorRead >= settings.updateInterval) {
     lastSensorRead = millis();
-    
-    // Чтение pH
-    phArray[phArrayIndex++] = analogRead(phPin);
-    if (phArrayIndex == ARRAY_LENGTH) phArrayIndex = 0;
-    float phAvg = averageArray(phArray, ARRAY_LENGTH);
-    sensorValues.phRaw = phAvg;
-    
-    float phVoltage = phAvg * (VCC / 4095.0);
-    sensorValues.phValue = 7.0 - ((phVoltage - 2.5) / 0.18);
-    sensorValues.phValue = (sensorValues.phValue + settings.calibration.phOffset) * settings.calibration.phScale;
-    
-    // Чтение ORP
-    orpArray[orpArrayIndex++] = analogRead(orpPin);
-    if (orpArrayIndex == ARRAY_LENGTH) orpArrayIndex = 0;
-    float orpAvg = averageArray(orpArray, ARRAY_LENGTH);
-    sensorValues.orpRaw = orpAvg;
-    
-    sensorValues.orpValue = ((30 * VCC * 1000) - (75 * orpAvg * VCC * 1000/4095))/75 - settings.calibration.orpOffset;
-    sensorValues.orpValue *= settings.calibration.orpScale;
-    
-    // Отправка данных в MQTT
-    if (mqttClient.connected()) {
-      StaticJsonDocument<200> doc;
-      doc["ph"] = sensorValues.phValue;
-      doc["orp"] = sensorValues.orpValue;
-      doc["ph_raw"] = sensorValues.phRaw;
-      doc["orp_raw"] = sensorValues.orpRaw;
-      String output;
-      serializeJson(doc, output);
-      mqttClient.publish("homeassistant/sensor/water_sensor/state", output.c_str());
-    } else {
-      setupMQTT();
-    }
-    
-    // Индикация работы
+    readSensors();
+    publishSensorData();
+
+    // Индикация состояния светодиодом
     if (WiFi.getMode() == WIFI_AP) {
-      digitalWrite(ledPin, LOW);
-      delay(100);
+      // Режим точки доступа - медленное мигание
+      static unsigned long lastBlink = 0;
+      if (millis() - lastBlink > 1000) {
+        digitalWrite(ledPin, !digitalRead(ledPin));
+        lastBlink = millis();
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      // Подключено к WiFi - короткая вспышка при отправке данных
       digitalWrite(ledPin, HIGH);
+      delay(50);
+      digitalWrite(ledPin, LOW);
     } else {
-      digitalWrite(ledPin, HIGH);
-      delay(100);
-      digitalWrite(ledPin, LOW);
+      // Попытка подключения - быстрое мигание
+      static unsigned long lastBlink = 0;
+      if (millis() - lastBlink > 200) {
+        digitalWrite(ledPin, !digitalRead(ledPin));
+        lastBlink = millis();
+      }
     }
   }
 }
 
-void setupWiFi() {
-  if (strlen(settings.wifiSSID) == 0) {
-    WiFi.mode(WIFI_AP);
-    String apName = settings.deviceName;
-    WiFi.softAP(apName.c_str());
-    digitalWrite(ledPin, HIGH);
-    return;
-  }
-  
-  String hostName = settings.deviceName;
-  hostName.replace("_", "-");
-  WiFi.setHostname(hostName.c_str());
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(settings.wifiSSID, settings.wifiPassword);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    attempts++;
-    digitalWrite(ledPin, !digitalRead(ledPin));
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(ledPin, LOW);
-  } else {
-    WiFi.mode(WIFI_AP);
-    String apName = settings.deviceName;
-    WiFi.softAP(apName.c_str());
-    digitalWrite(ledPin, HIGH);
-  }
-}
+// --- Реализация функций ---
 
-void setupMQTT() {
-  mqttClient.setServer(settings.mqttServer, settings.mqttPort);
-  if (mqttClient.connect(settings.deviceName, settings.mqttUser, settings.mqttPassword)) {
-    Serial.println("MQTT connected");
-  }
-}
-
+// Загрузка настроек из EEPROM
 void loadSettings() {
-  EEPROM.begin(512);
-  EEPROM.get(0, settings);
-  EEPROM.end();
-  
-  // Проверяем валидность настроек и устанавливаем значения по умолчанию если нужно
-  if (settings.updateInterval < 1000 || settings.updateInterval > 60000) {
-    settings.updateInterval = DEFAULT_UPDATE_INTERVAL;
-  }
-  
-  if (settings.mqttPort <= 0 || settings.mqttPort > 65535) {
-    settings.mqttPort = MQTT_PORT; // Стандартный порт MQTT
-  }
-  
-  if (strlen(settings.deviceName) == 0 || strlen(settings.deviceName) >= sizeof(settings.deviceName)) {
+  Serial.println(F("Loading settings from EEPROM..."));
+  Settings loadedSettings; // Временная структура для чтения
+  EEPROM.get(0, loadedSettings);
+
+  // Проверяем версию настроек (или "магическое число")
+  if (loadedSettings.settingsVersion != CURRENT_SETTINGS_VERSION) {
+    Serial.println(F("Settings version mismatch or EEPROM empty/corrupted. Loading default settings."));
+    // Устанавливаем значения по умолчанию
+    settings.settingsVersion = CURRENT_SETTINGS_VERSION;
     String defaultName = getDeviceName();
-    memset(settings.deviceName, 0, sizeof(settings.deviceName));
-    strncpy(settings.deviceName, defaultName.c_str(), sizeof(settings.deviceName) - 1);
-    settings.deviceName[sizeof(settings.deviceName) - 1] = '\0';
+    strlcpy(settings.deviceName, defaultName.c_str(), sizeof(settings.deviceName));
+    strlcpy(settings.wifiSSID, "", sizeof(settings.wifiSSID));
+    strlcpy(settings.wifiPassword, "", sizeof(settings.wifiPassword));
+    strlcpy(settings.mqttServer, "", sizeof(settings.mqttServer)); // Пустой сервер по умолчанию
+    settings.mqttPort = 1883;
+    strlcpy(settings.mqttUser, "", sizeof(settings.mqttUser));
+    strlcpy(settings.mqttPassword, "", sizeof(settings.mqttPassword));
+    settings.updateInterval = DEFAULT_UPDATE_INTERVAL;
+    settings.calibration.phOffset = DEFAULT_PH_OFFSET;
+    settings.calibration.phScale = DEFAULT_PH_SCALE;
+    settings.calibration.orpOffset = DEFAULT_ORP_OFFSET;
+    settings.calibration.orpScale = DEFAULT_ORP_SCALE;
+    // Сохраняем дефолтные настройки обратно в EEPROM
+    EEPROM.put(0, settings);
+    if (!EEPROM.commit()) {
+      Serial.println(F("ERROR: EEPROM commit failed while saving default settings!"));
+    } else {
+        Serial.println(F("Default settings saved to EEPROM."));
+    }
+  } else {
+    // Версия совпадает, копируем загруженные настройки
+    Serial.println(F("Valid settings found in EEPROM."));
+    memcpy(&settings, &loadedSettings, sizeof(Settings));
   }
-  
-  // Обеспечиваем нулевое завершение всех строк
+
+  // Дополнительная проверка и null-терминация (на всякий случай)
+  settings.deviceName[sizeof(settings.deviceName) - 1] = '\0';
   settings.wifiSSID[sizeof(settings.wifiSSID) - 1] = '\0';
   settings.wifiPassword[sizeof(settings.wifiPassword) - 1] = '\0';
   settings.mqttServer[sizeof(settings.mqttServer) - 1] = '\0';
   settings.mqttUser[sizeof(settings.mqttUser) - 1] = '\0';
   settings.mqttPassword[sizeof(settings.mqttPassword) - 1] = '\0';
+
+  // Валидация загруженных значений (даже если версия совпала)
+   if (settings.updateInterval < 1000 || settings.updateInterval > 3600000) {
+       Serial.println(F("Warning: Invalid update interval found, setting default."));
+       settings.updateInterval = DEFAULT_UPDATE_INTERVAL;
+       saveSettings(); // Сохраняем исправление
+   }
+    if (settings.mqttPort <= 0 || settings.mqttPort > 65535) {
+        Serial.println(F("Warning: Invalid MQTT port found, setting default."));
+        settings.mqttPort = DEFAULT_MQTT_PORT;
+        saveSettings(); // Сохраняем исправление
+    }
+     if (strlen(settings.deviceName) == 0) {
+        Serial.println(F("Warning: Device name is empty, generating default."));
+        String defaultName = getDeviceName();
+        strlcpy(settings.deviceName, defaultName.c_str(), sizeof(settings.deviceName));
+        saveSettings(); // Сохраняем исправление
+     }
+     // Проверка калибровочных значений на NaN/Inf
+     if (isnan(settings.calibration.phOffset) || isinf(settings.calibration.phOffset)) { settings.calibration.phOffset = DEFAULT_PH_OFFSET; saveSettings(); }
+     if (isnan(settings.calibration.phScale) || isinf(settings.calibration.phScale) || settings.calibration.phScale == 0) { settings.calibration.phScale = DEFAULT_PH_SCALE; saveSettings();}
+     if (isnan(settings.calibration.orpOffset) || isinf(settings.calibration.orpOffset)) { settings.calibration.orpOffset = DEFAULT_ORP_OFFSET; saveSettings();}
+     if (isnan(settings.calibration.orpScale) || isinf(settings.calibration.orpScale) || settings.calibration.orpScale == 0) { settings.calibration.orpScale = DEFAULT_ORP_SCALE; saveSettings();}
+
+
+  Serial.println(F("Settings loaded successfully."));
+  Serial.printf("Device Name: %s\n", settings.deviceName);
+  Serial.printf("WiFi SSID: %s\n", settings.wifiSSID);
+  Serial.printf("MQTT Server: %s:%d\n", settings.mqttServer, settings.mqttPort);
+  Serial.printf("Update Interval: %d ms\n", settings.updateInterval);
 }
 
+// Сохранение настроек в EEPROM
 void saveSettings() {
-  EEPROM.begin(512);
+  Serial.println(F("Saving settings to EEPROM..."));
+  // Убедимся, что версия актуальна перед сохранением
+  settings.settingsVersion = CURRENT_SETTINGS_VERSION;
   EEPROM.put(0, settings);
-  EEPROM.commit();
-  EEPROM.end();
+  if (EEPROM.commit()) {
+    Serial.println(F("EEPROM commit successful."));
+  } else {
+    Serial.println(F("ERROR: EEPROM commit failed!"));
+  }
 }
 
-String getDeviceName() {
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  char deviceName[20];
-  snprintf(deviceName, sizeof(deviceName), "Water_%02X%02X%02X", mac[3], mac[4], mac[5]);
-  return String(deviceName);
-}
-
-void resetWiFi() {
-  digitalWrite(ledPin, HIGH);
-  
-  server.stop();
-  WiFi.disconnect(true);
-  delay(1000);
-  
-  // Очищаем настройки WiFi
-  strncpy(settings.wifiSSID, "", sizeof(settings.wifiSSID) - 1);
-  strncpy(settings.wifiPassword, "", sizeof(settings.wifiPassword) - 1);
-  
-  saveSettings();
-  
-  WiFi.disconnect();
-  WiFi.mode(WIFI_AP);
-  
-  String apName = settings.deviceName;
-  WiFi.softAP(apName.c_str());
-  
-  server.begin();
-  
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(ledPin, LOW);
-    delay(100);
+// Настройка WiFi
+void setupWiFi() {
+  Serial.println(F("Setting up WiFi..."));
+  if (strlen(settings.wifiSSID) == 0) {
+    // Запуск в режиме точки доступа
+    Serial.println(F("No SSID configured. Starting Access Point..."));
+    WiFi.mode(WIFI_AP);
+    String apName = String(settings.deviceName);
+    WiFi.softAP(apName.c_str());
+    Serial.printf("AP SSID: %s\n", apName.c_str());
+    Serial.printf("AP IP address: %s\n", WiFi.softAPIP().toString().c_str());
     digitalWrite(ledPin, HIGH);
+    return;
+  }
+
+  // Подключение к WiFi сети
+  Serial.printf("Connecting to %s\n", settings.wifiSSID);
+  String hostname = String(settings.deviceName);
+  hostname.toLowerCase();
+  hostname.replace("_", "-");
+  WiFi.setHostname(hostname.c_str());
+  
+  // Быстрое отключение от текущей сети
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect();
     delay(100);
   }
   
-  delay(3000);
+  WiFi.mode(WIFI_STA);
+  
+  // Быстрые попытки подключения
+  for (int attempt = 0; attempt < WIFI_RECONNECT_ATTEMPTS; attempt++) {
+    WiFi.begin(settings.wifiSSID, settings.wifiPassword);
+    
+    unsigned long startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && 
+           millis() - startAttemptTime < WIFI_CONNECT_TIMEOUT) {
+      delay(100);
+      Serial.print(".");
+      digitalWrite(ledPin, !digitalRead(ledPin));
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println(F("\nWiFi connected!"));
+      Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("Hostname: %s\n", hostname.c_str());
+      digitalWrite(ledPin, LOW);
+      return;
+    }
+    
+    // Если не удалось подключиться, пробуем снова
+    WiFi.disconnect();
+    delay(100);
+  }
+  
+  // Если все попытки неудачны, запускаем AP
+  Serial.println(F("\nFailed to connect to WiFi. Starting AP as fallback."));
+  resetWiFi();
+}
+
+// Подключение к MQTT
+bool setupMQTT() {
+  if (WiFi.status() != WL_CONNECTED || strlen(settings.mqttServer) == 0) {
+    Serial.println(F("MQTT setup skipped: No WiFi or MQTT server not configured."));
+    return false;
+  }
+  Serial.printf("Attempting MQTT connection to %s:%d...\n", settings.mqttServer, settings.mqttPort);
+  mqttClient.setServer(settings.mqttServer, settings.mqttPort);
+  // mqttClient.setCallback(callback); // Добавьте, если нужна обработка входящих сообщений
+
+  String clientId = String(settings.deviceName) + "-client-" + String(random(0xffff), HEX);
+  Serial.printf("Connecting with Client ID: %s\n", clientId.c_str());
+
+  bool result;
+  if (strlen(settings.mqttUser) > 0) {
+    result = mqttClient.connect(clientId.c_str(), settings.mqttUser, settings.mqttPassword);
+  } else {
+    result = mqttClient.connect(clientId.c_str());
+  }
+
+  if (result) {
+    Serial.println(F("MQTT connected!"));
+    // Можно подписаться на топики здесь, если нужно
+    // client.subscribe("your/topic");
+  } else {
+    Serial.print(F("MQTT connection failed, rc="));
+    Serial.print(mqttClient.state());
+    Serial.println(F(" Retrying later..."));
+  }
+  return result;
+}
+
+// Сброс настроек WiFi
+void resetWiFi() {
+  Serial.println(F("Resetting WiFi settings and restarting..."));
+  digitalWrite(ledPin, HIGH);
+
+  EEPROM.begin(sizeof(Settings));
+  // Читаем текущие настройки, чтобы не затереть остальные
+  EEPROM.get(0, settings);
+
+  // Очищаем только WiFi поля
+  Serial.println(F("Clearing WiFi SSID and Password."));
+  memset(settings.wifiSSID, 0, sizeof(settings.wifiSSID));
+  memset(settings.wifiPassword, 0, sizeof(settings.wifiPassword));
+  settings.settingsVersion = CURRENT_SETTINGS_VERSION; // Убедимся, что версия актуальна
+
+  Serial.println(F("Saving settings with cleared WiFi info..."));
+  EEPROM.put(0, settings);
+  bool commitOK = EEPROM.commit();
+  EEPROM.end();
+
+  if (!commitOK) {
+    Serial.println(F("ERROR: EEPROM commit failed during WiFi reset!"));
+  }
+
+  // Индикация и перезагрузка
+  digitalWrite(ledPin, LOW); delay(200); digitalWrite(ledPin, HIGH); delay(200); digitalWrite(ledPin, LOW);
+  Serial.println(F("Restarting now to apply changes (AP mode)."));
+  delay(500);
   ESP.restart();
 }
 
-float averageArray(int* arr, int number) {
-  if (number <= 0) return 0;
-  float sum = 0;
-  for (int i = 0; i < number; i++) {
-    sum += arr[i];
+// Полный сброс настроек к заводским
+void factoryReset() {
+  Serial.println(F("!!! FACTORY RESET initiated !!!"));
+  digitalWrite(ledPin, HIGH); // Индикация
+
+  EEPROM.begin(sizeof(Settings));
+
+  // Просто записываем пустую структуру (или структуру с дефолтами)
+   Settings defaultSettings;
+   memset(&defaultSettings, 0, sizeof(Settings)); // Очищаем структуру
+
+   // Устанавливаем дефолтные значения
+   defaultSettings.settingsVersion = CURRENT_SETTINGS_VERSION;
+   String defaultName = getDeviceName(); // Генерируем имя заранее
+   strlcpy(defaultSettings.deviceName, defaultName.c_str(), sizeof(defaultSettings.deviceName));
+   strlcpy(defaultSettings.mqttServer, "", sizeof(defaultSettings.mqttServer)); // Пустой сервер по умолчанию
+   defaultSettings.mqttPort = 1883;
+   strlcpy(defaultSettings.mqttUser, "", sizeof(defaultSettings.mqttUser));
+   strlcpy(defaultSettings.mqttPassword, "", sizeof(defaultSettings.mqttPassword));
+   defaultSettings.updateInterval = DEFAULT_UPDATE_INTERVAL;
+   defaultSettings.calibration.phOffset = DEFAULT_PH_OFFSET;
+   defaultSettings.calibration.phScale = DEFAULT_PH_SCALE;
+   defaultSettings.calibration.orpOffset = DEFAULT_ORP_OFFSET;
+   defaultSettings.calibration.orpScale = DEFAULT_ORP_SCALE;
+   // WiFi SSID и Password остаются пустыми
+
+  Serial.println(F("Saving default settings to EEPROM..."));
+  EEPROM.put(0, defaultSettings); // Записываем дефолты
+  bool commitOK = EEPROM.commit();
+  EEPROM.end();
+
+  if (commitOK) {
+    Serial.println(F("Default settings saved successfully."));
+  } else {
+    Serial.println(F("ERROR: EEPROM commit failed during factory reset!"));
   }
-  return sum / number;
+
+  // Индикация и перезагрузка
+  for (int i = 0; i < 5; i++) { digitalWrite(ledPin, LOW); delay(100); digitalWrite(ledPin, HIGH); delay(100); }
+  digitalWrite(ledPin, LOW);
+  Serial.println(F("Factory reset complete. Restarting now (AP mode)."));
+  delay(1000);
+  ESP.restart();
+}
+
+// Генерация имени устройства
+String getDeviceName() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char baseName[20];
+  snprintf(baseName, sizeof(baseName), "Water_%02X%02X%02X", mac[3], mac[4], mac[5]);
+  return String(baseName);
+}
+
+// --- Функции веб-интерфейса ---
+
+// Генерация CSS стилей
+String getCSS() {
+  String css = "<style>";
+  css += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; color: #343a40; }";
+  css += ".container { max-width: 800px; margin: 20px auto; background: #ffffff; padding: 25px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }";
+  css += "h1, h2, h3 { color: #212529; margin-top: 0; margin-bottom: 1rem; }";
+  css += "nav { background-color: #e9ecef; padding: 10px 0; margin-bottom: 25px; border-radius: 5px; text-align: center;}";
+  css += "nav a { text-decoration: none; color: #495057; margin: 0 10px; padding: 8px 15px; border-radius: 4px; transition: background-color 0.2s, color 0.2s; font-weight: 500; }";
+  css += "nav a:hover { background-color: #dee2e6; color: #212529; }";
+  css += "nav a.active { background-color: #007bff; color: #ffffff; }";
+  css += "label { display: block; margin: 1rem 0 0.5rem 0; color: #495057; font-weight: 500; }";
+  css += "input[type='text'], input[type='password'], input[type='number'] { width: 100%; padding: 0.75rem; margin-bottom: 0.75rem; border: 1px solid #ced4da; border-radius: 4px; font-size: 1rem; box-sizing: border-box; transition: border-color 0.2s, box-shadow 0.2s; }";
+  css += "input[type='text']:focus, input[type='password']:focus, input[type='number']:focus { border-color: #80bdff; outline: 0; box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25); }";
+  css += "input[type='submit'], .button { background-color: #007bff; color: white; border: none; padding: 0.75rem 1.25rem; margin-top: 1rem; border-radius: 4px; cursor: pointer; font-size: 1rem; transition: background-color 0.2s; font-weight: 500; }";
+  css += "input[type='submit']:hover, .button:hover { background-color: #0056b3; }";
+  css += ".button.warning { background-color: #dc3545; } .button.warning:hover { background-color: #c82333; }";
+  css += ".message { padding: 1rem; margin: 1.5rem 0; border-radius: 4px; border: 1px solid transparent; }";
+  css += ".success { background-color: #d1e7dd; color: #0f5132; border-color: #badbcc; }";
+  css += ".error { background-color: #f8d7da; color: #842029; border-color: #f5c2c7; }";
+  css += ".sensor-data div, .calibration-section div { margin-bottom: 0.75rem; font-size: 1.1rem; }";
+  css += ".sensor-label { font-weight: 500; color: #6c757d; min-width: 140px; display: inline-block; }";
+  css += ".value-display { font-family: 'Courier New', Courier, monospace; font-weight: bold; color: #007bff; }";
+  css += ".form-section { margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid #e9ecef; } .form-section:last-child { border-bottom: none; }";
+  css += ".reset-section { margin-top: 2rem; padding: 1.5rem; border: 1px solid #f5c2c7; background-color: #f8d7da; border-radius: 5px;}";
+  css += "small { color: #6c757d; font-size: 0.875em; display: block; margin-top: -0.5rem; margin-bottom: 0.5rem;}";
+  css += "</style>";
+  return css;
+}
+
+// Генерация навигационного меню
+String getNavigationMenu(String activePage = "") {
+  String menu = "<nav class='menu'>";
+  menu += String("<a href='/' ") + (activePage == "root" ? "class='active'" : "") + ">Данные</a>";
+  menu += String("<a href='/settings' ") + (activePage == "settings" ? "class='active'" : "") + ">Настройки</a>";
+  menu += String("<a href='/calibration' ") + (activePage == "calibration" ? "class='active'" : "") + ">Калибровка</a>";
+  menu += String("<a href='/update' ") + (activePage == "update" ? "class='active'" : "") + ">Обновление ПО</a>";
+  menu += String("<a href='/about' ") + (activePage == "about" ? "class='active'" : "") + ">О проекте</a>";
+  menu += "</nav>";
+  return menu;
+}
+
+// Обработчик главной страницы (/)
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<title>ORP/pH Sensor - Данные</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<meta http-equiv='refresh' content='10'>";// Автообновление каждые 10 сек
+  html += getCSS();
+  html += "</head><body><div class='container'>";
+  html += getNavigationMenu("root");
+  html += "<h1>Текущие показания</h1>";
+  html += "<div class='sensor-data'>";
+  html += "<div><span class='sensor-label'>pH:</span> <span class='value-display'>" + String(sensorValues.phValue, 2) + "</span></div>";
+  html += "<div><span class='sensor-label'>ORP:</span> <span class='value-display'>" + String(sensorValues.orpValue, 1) + "</span> mV</div>";
+  html += "<hr style='margin: 1rem 0; border-top: 1px solid #eee;'>";
+  html += "<div><span class='sensor-label' style='color:#adb5bd;'>pH Raw ADC:</span> <span class='value-display' style='color:#adb5bd;'>" + String(sensorValues.phRaw, 0) + "</span></div>";
+  html += "<div><span class='sensor-label' style='color:#adb5bd;'>ORP Raw ADC:</span> <span class='value-display' style='color:#adb5bd;'>" + String(sensorValues.orpRaw, 0) + "</span></div>";
+  html += "</div>";
+  html += "</div></body></html>";
+  server.sendHeader("Content-Type", "text/html; charset=UTF-8");
+  server.send(200, "text/html", html);
+}
+
+// Обработчик страницы настроек (/settings)
+void handleSettings() {
+  String message = "";
+  bool needRestart = false;
+
+  if (server.method() == HTTP_POST) {
+    bool settingsUpdated = false;
+    Serial.println(F("Processing POST /settings"));
+
+    // --- Имя устройства ---
+    if (server.hasArg("deviceName")) {
+      String newName = server.arg("deviceName");
+      newName.trim();
+      if (newName.length() > 0 && newName.length() < sizeof(settings.deviceName)) {
+         bool nameChanged = (strcmp(settings.deviceName, newName.c_str()) != 0);
+         if (nameChanged) {
+            Serial.printf("Device name changing from '%s' to '%s'\n", settings.deviceName, newName.c_str());
+            strlcpy(settings.deviceName, newName.c_str(), sizeof(settings.deviceName));
+            settingsUpdated = true;
+            needRestart = true;
+         }
+      } else {
+          Serial.printf("Invalid device name received: '%s'\n", newName.c_str());
+          message += "Ошибка: Недопустимое имя устройства.<br>";
+      }
+    }
+
+    // --- WiFi ---
+    if (server.hasArg("wifiSSID")) {
+      String newSSID = server.arg("wifiSSID");
+      String newPassword = server.hasArg("wifiPassword") ? server.arg("wifiPassword") : "";
+      if (strcmp(settings.wifiSSID, newSSID.c_str()) != 0 || strcmp(settings.wifiPassword, newPassword.c_str()) != 0) {
+        Serial.printf("WiFi settings changing. New SSID: '%s'\n", newSSID.c_str());
+        strlcpy(settings.wifiSSID, newSSID.c_str(), sizeof(settings.wifiSSID));
+        strlcpy(settings.wifiPassword, newPassword.c_str(), sizeof(settings.wifiPassword));
+        settingsUpdated = true;
+        needRestart = true;
+      }
+    }
+
+    // --- MQTT ---
+    bool mqttChanged = false;
+    if (server.hasArg("mqttServer")) {
+      String newServer = server.arg("mqttServer");
+      if (strcmp(settings.mqttServer, newServer.c_str()) != 0) {
+        strlcpy(settings.mqttServer, newServer.c_str(), sizeof(settings.mqttServer));
+        mqttChanged = true;
+      }
+    }
+    if (server.hasArg("mqttPort")) {
+      int newPort = server.arg("mqttPort").toInt();
+      if (newPort > 0 && newPort <= 65535 && settings.mqttPort != newPort) {
+        settings.mqttPort = newPort;
+        mqttChanged = true;
+      }
+    }
+     if (server.hasArg("mqttUser")) {
+        String newUser = server.arg("mqttUser");
+        if (strcmp(settings.mqttUser, newUser.c_str()) != 0) {
+           strlcpy(settings.mqttUser, newUser.c_str(), sizeof(settings.mqttUser));
+           mqttChanged = true;
+        }
+     }
+     if (server.hasArg("mqttPassword")) {
+        String newMqttPwd = server.arg("mqttPassword");
+         if (strcmp(settings.mqttPassword, newMqttPwd.c_str()) != 0) {
+             strlcpy(settings.mqttPassword, newMqttPwd.c_str(), sizeof(settings.mqttPassword));
+             mqttChanged = true;
+         }
+     }
+     if (mqttChanged) {
+        Serial.println(F("MQTT settings changed. Will reconnect."));
+        settingsUpdated = true;
+        // Переподключение произойдет в loop()
+     }
+
+    // --- Интервал обновления ---
+    if (server.hasArg("updateInterval")) {
+      int newInterval = server.arg("updateInterval").toInt();
+      if (newInterval >= 1000 && newInterval <= 3600000 && settings.updateInterval != newInterval) {
+        Serial.printf("Update interval changing from %d to %d\n", settings.updateInterval, newInterval);
+        settings.updateInterval = newInterval;
+        settingsUpdated = true;
+      }
+    }
+
+    // --- Сохранение ---
+    if (settingsUpdated) {
+      saveSettings();
+      message += "Настройки успешно сохранены.";
+      if (needRestart) {
+        message += " Устройство перезагрузится через 3 секунды для применения изменений.";
+      }
+    } else if (message.length() == 0) {
+      message = "Изменений не было.";
+    }
+  } // end POST
+
+  // --- Отображение страницы (GET или после POST) ---
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<title>ORP/pH Sensor - Настройки</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += getCSS();
+  html += "</head><body><div class='container'>";
+  html += getNavigationMenu("settings");
+  html += "<h1>Настройки устройства</h1>";
+
+  if (message.length() > 0) {
+    String messageClass = message.indexOf("Ошибка") != -1 ? "error" : "success";
+    html += String("<div class='message ") + messageClass + "'>" + message + "</div>";
+     if (needRestart) {
+        html += "<script>setTimeout(function(){ window.location.href='/'; }, 3000);</script>";
+     } else if (server.method() == HTTP_POST && message.indexOf("Ошибка") == -1) {
+         html += "<script>setTimeout(function(){ window.location.href='/settings'; }, 1000);</script>";
+     }
+  }
+
+  html += "<form method='post'>";
+  html += "<div class='form-section'>";
+  html += "<h3>Общие</h3>";
+  html += "<label for='deviceName'>Имя устройства:</label>";
+  html += "<input type='text' id='deviceName' name='deviceName' value='" + String(settings.deviceName) + "' required maxlength='" + String(sizeof(settings.deviceName)-1) + "'>";
+  html += "<small>Используется для Hostname, MQTT Client ID, имени точки доступа.</small>";
+  html += "<label for='updateInterval'>Интервал обновления (мс):</label>";
+  html += "<input type='number' id='updateInterval' name='updateInterval' value='" + String(settings.updateInterval) + "' min='1000' max='3600000' required>";
+  html += "<small>Как часто считывать показания датчиков (1000 мс = 1 сек).</small>";
+  html += "</div>";
+
+  html += "<div class='form-section'>";
+  html += "<h3>WiFi</h3>";
+  html += "<label for='wifiSSID'>Имя сети (SSID):</label>";
+  html += "<input type='text' id='wifiSSID' name='wifiSSID' value='" + String(settings.wifiSSID) + "' maxlength='" + String(sizeof(settings.wifiSSID)-1) + "'>";
+  html += "<small>Оставьте пустым для запуска устройства в режиме точки доступа.</small>";
+  html += "<label for='wifiPassword'>Пароль:</label>";
+  html += "<input type='password' id='wifiPassword' name='wifiPassword' value='" + String(settings.wifiPassword) + "' maxlength='" + String(sizeof(settings.wifiPassword)-1) + "'>";
+  html += "</div>";
+
+  html += "<div class='form-section'>";
+  html += "<h3>MQTT</h3>";
+  html += "<label for='mqttServer'>Сервер:</label>";
+  html += "<input type='text' id='mqttServer' name='mqttServer' value='" + String(settings.mqttServer) + "' maxlength='" + String(sizeof(settings.mqttServer)-1) + "' placeholder='Например: mqtt.local или 192.168.1.100'>";
+  html += "<small>IP-адрес или доменное имя MQTT сервера. Оставьте пустым для отключения MQTT.</small>";
+  html += "<label for='mqttPort'>Порт:</label>";
+  html += "<input type='number' id='mqttPort' name='mqttPort' value='" + String(settings.mqttPort) + "' min='1' max='65535' required placeholder='Обычно 1883'>";
+  html += "<small>Порт MQTT сервера. По умолчанию: 1883</small>";
+  html += "<label for='mqttUser'>Пользователь (если требуется):</label>";
+  html += "<input type='text' id='mqttUser' name='mqttUser' value='" + String(settings.mqttUser) + "' maxlength='" + String(sizeof(settings.mqttUser)-1) + "' placeholder='Имя пользователя MQTT'>";
+  html += "<label for='mqttPassword'>Пароль (если требуется):</label>";
+  html += "<input type='password' id='mqttPassword' name='mqttPassword' value='" + String(settings.mqttPassword) + "' maxlength='" + String(sizeof(settings.mqttPassword)-1) + "' placeholder='Пароль MQTT'>";
+  html += "</div>";
+
+  html += "<input type='submit' value='Сохранить настройки'>";
+  html += "</form>";
+
+  html += "</div></body></html>";
+  server.sendHeader("Content-Type", "text/html; charset=UTF-8");
+  server.send(200, "text/html", html);
+
+  // Перезагрузка после отправки ответа, если нужно
+  if (needRestart && server.method() == HTTP_POST) {
+    Serial.println(F("Restarting ESP due to settings change..."));
+    delay(3000);
+    ESP.restart();
+  }
+}
+
+// Обработчик страницы калибровки (/calibration)
+void handleCalibration() {
+    String message = "";
+    bool calibrationUpdated = false;
+
+    if (server.method() == HTTP_POST) {
+        Serial.println(F("Processing POST /calibration"));
+        if (server.hasArg("reset_calibration")) {
+             Serial.println(F("Resetting calibration to defaults..."));
+             settings.calibration.phOffset = DEFAULT_PH_OFFSET;
+             settings.calibration.phScale = DEFAULT_PH_SCALE;
+             settings.calibration.orpOffset = DEFAULT_ORP_OFFSET;
+             settings.calibration.orpScale = DEFAULT_ORP_SCALE;
+             saveSettings();
+             message = "Калибровка сброшена на значения по умолчанию.";
+             calibrationUpdated = true;
+        } else {
+            bool updateOk = true;
+            float tempPhOffset = settings.calibration.phOffset;
+            float tempPhScale = settings.calibration.phScale;
+            float tempOrpOffset = settings.calibration.orpOffset;
+            float tempOrpScale = settings.calibration.orpScale;
+
+            if (server.hasArg("phOffset")) tempPhOffset = server.arg("phOffset").toFloat();
+            if (server.hasArg("phScale")) tempPhScale = server.arg("phScale").toFloat();
+            if (server.hasArg("orpOffset")) tempOrpOffset = server.arg("orpOffset").toFloat();
+            if (server.hasArg("orpScale")) tempOrpScale = server.arg("orpScale").toFloat();
+
+            if (isnan(tempPhOffset) || isinf(tempPhOffset) ||
+                isnan(tempPhScale) || isinf(tempPhScale) || tempPhScale == 0 ||
+                isnan(tempOrpOffset) || isinf(tempOrpOffset) ||
+                isnan(tempOrpScale) || isinf(tempOrpScale) || tempOrpScale == 0)
+            {
+                Serial.println(F("Invalid calibration values received."));
+                message = "Ошибка: Недопустимые значения калибровки.";
+                updateOk = false;
+            }
+
+            if (updateOk) {
+                settings.calibration.phOffset = tempPhOffset;
+                settings.calibration.phScale = tempPhScale;
+                settings.calibration.orpOffset = tempOrpOffset;
+                settings.calibration.orpScale = tempOrpScale;
+                saveSettings();
+                message = "Калибровка успешно сохранена.";
+                calibrationUpdated = true;
+            }
+        }
+    } // end POST
+
+    // --- Отображение страницы (GET или после POST) ---
+    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+    html += "<title>ORP/pH Sensor - Калибровка</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += getCSS();
+     html += "<script>";
+     html += "function confirmReset() { return confirm('Вы уверены, что хотите сбросить калибровку на значения по умолчанию?'); }";
+     html += "</script>";
+    html += "</head><body><div class='container'>";
+    html += getNavigationMenu("calibration");
+    html += "<h1>Калибровка датчиков</h1>";
+
+    if (message.length() > 0) {
+        String messageClass = message.indexOf("Ошибка") != -1 ? "error" : "success";
+        html += String("<div class='message ") + messageClass + "'>" + message + "</div>";
+        if (calibrationUpdated && message.indexOf("Ошибка") == -1) {
+             html += "<script>setTimeout(function(){ window.location.href='/calibration'; }, 1000);</script>";
+        }
+    }
+
+    html += "<h3>Текущие показания (для справки)</h3>";
+    html += "<div class='sensor-data'>";
+    html += "<div><span class='sensor-label'>pH:</span> <span class='value-display'>" + String(sensorValues.phValue, 2) + "</span></div>";
+    html += "<div><span class='sensor-label'>ORP:</span> <span class='value-display'>" + String(sensorValues.orpValue, 1) + "</span> mV</div>";
+    html += "</div>";
+
+    html += "<h3>Настройка калибровки</h3>";
+    html += "<p>Отрегулируйте смещение (Offset) и множитель (Scale) для каждого датчика, чтобы показания соответствовали эталонным значениям. Формула: `Итоговое_Значение = (Сырое_Значение_в_ед_изм - Offset) * Scale`</p>";
+    html += "<form method='post'>";
+    html += "<div class='form-section'>";
+    html += "<h4>pH Датчик</h4>";
+    html += "<label for='phOffset'>Смещение pH (Offset):</label>";
+    html += "<input type='number' step='0.01' id='phOffset' name='phOffset' value='" + String(settings.calibration.phOffset, 2) + "'>";
+     html += "<small>Вычитается из рассчитанного значения pH перед умножением.</small>";
+    html += "<label for='phScale'>Множитель pH (Scale):</label>";
+    html += "<input type='number' step='0.01' id='phScale' name='phScale' value='" + String(settings.calibration.phScale, 2) + "'>";
+     html += "<small>Коэффициент, на который умножается значение после вычета смещения.</small>";
+    html += "</div>";
+
+    html += "<div class='form-section'>";
+    html += "<h4>ORP Датчик</h4>";
+    html += "<label for='orpOffset'>Смещение ORP (Offset, mV):</label>";
+    html += "<input type='number' step='0.1' id='orpOffset' name='orpOffset' value='" + String(settings.calibration.orpOffset, 1) + "'>";
+     html += "<small>Вычитается из рассчитанного значения ORP (в мВ) перед умножением.</small>";
+    html += "<label for='orpScale'>Множитель ORP (Scale):</label>";
+    html += "<input type='number' step='0.01' id='orpScale' name='orpScale' value='" + String(settings.calibration.orpScale, 2) + "'>";
+     html += "<small>Коэффициент, на который умножается значение после вычета смещения.</small>";
+    html += "</div>";
+
+    html += "<input type='submit' value='Сохранить калибровку'>";
+    html += "</form>";
+
+    html += "<div class='reset-section'>";
+    html += "<h3>Сброс калибровки</h3>";
+    html += "<form method='post' onsubmit='return confirmReset();'>";
+    html += "<input type='hidden' name='reset_calibration' value='true'>";
+    html += "<input type='submit' class='button warning' value='Сбросить на по умолчанию'>";
+    html += "</form>";
+    html += "</div>";
+
+    html += "</div></body></html>";
+    server.sendHeader("Content-Type", "text/html; charset=UTF-8");
+    server.send(200, "text/html", html);
+}
+
+// Страница обновления прошивки
+void handleUpdateFirmware() {
+    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+    html += "<title>ORP/pH Sensor - Обновление ПО</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += getCSS();
+    html += "</head><body><div class='container'>";
+    html += getNavigationMenu("update");
+    html += "<h1>Обновление прошивки</h1>";
+    html += "<p>Выберите файл прошивки (.bin) для загрузки на устройство.</p>";
+    html += "<form method='POST' action='/doUpdate' enctype='multipart/form-data'>";
+    html += "<label for='update'>Файл прошивки:</label>";
+    html += "<input type='file' id='update' name='update' accept='.bin' required style='padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; display: block; margin-bottom: 1rem;'><br>";
+    html += "<input type='submit' value='Загрузить и обновить'>";
+    html += "</form>";
+    html += "<p><strong>Внимание:</strong> Устройство перезагрузится после успешного обновления.</p>";
+    html += "</div></body></html>";
+    server.sendHeader("Content-Type", "text/html; charset=UTF-8");
+    server.send(200, "text/html", html);
+}
+
+// Обработчик ответа после загрузки файла прошивки
+void handleDoUpdate() {
+    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+    html += "<title>ORP/pH Sensor - Результат обновления</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += getCSS();
+    html += "<meta http-equiv='refresh' content='15;url=/' />"; // Увеличиваем время ожидания до 15 секунд
+    html += "</head><body><div class='container'>";
+    html += "<h1>Результат обновления</h1>";
+    
+    if (Update.hasError()) {
+        html += "<div class='message error'>Ошибка обновления! Код: " + String(Update.getError()) + "</div>";
+    } else {
+        html += "<div class='message success'>Обновление успешно завершено! Устройство перезагружается...</div>";
+        // Сохраняем настройки перед перезагрузкой
+        saveSettings();
+        // Даем время на сохранение
+        delay(2000);
+    }
+    
+    html += "<p><a href='/'>Вернуться на главную страницу</a></p>";
+    html += "</div></body></html>";
+    server.sendHeader("Content-Type", "text/html; charset=UTF-8");
+    server.send(200, "text/html", html);
+    
+    if (!Update.hasError()) {
+        // Даем время на отправку ответа клиенту
+        delay(3000);
+        ESP.restart();
+    }
+}
+
+
+// Обработчик страницы "О проекте" (/about)
+void handleAbout() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<title>ORP/pH Sensor - О проекте</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += getCSS();
+  html += "</head><body><div class='container'>";
+  html += getNavigationMenu("about");
+  html += "<h1>О проекте</h1>";
+  html += "<p>Система мониторинга pH и ORP на базе ESP32.</p>";
+  
+  html += "<div class='form-section'>";
+  html += "<h3>Информация об устройстве</h3>";
+  String hostname = String(settings.deviceName);
+  hostname.toLowerCase();
+  hostname.replace("_", "-");
+  html += "<p><strong>Имя устройства:</strong> " + String(settings.deviceName) + "</p>";
+  html += "<p><strong>Hostname (mDNS):</strong> " + hostname + ".local</p>";
+  html += "<p><strong>IP-адрес:</strong> " + (WiFi.getMode() == WIFI_AP ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "</p>";
+  html += "<p><strong>MAC-адрес:</strong> " + WiFi.macAddress() + "</p>";
+  html += "<p><strong>Версия прошивки:</strong> " + String(VERSION_STRING) + " (" + String(__DATE__) + " " + String(__TIME__) + ")</p>";
+  html += "</div>";
+
+  html += "<div class='form-section'>";
+  html += "<h3>Контактная информация</h3>";
+  html += "<p><strong>Автор:</strong> Колесник Станислав</p>";
+  html += "<p><strong>Telegram:</strong> <a href='https://t.me/Gfermoto' target='_blank'>@Gfermoto</a></p>";
+  html += "<p><strong>GitHub:</strong> <a href='https://github.com/Gfermoto' target='_blank'>github.com/Gfermoto</a></p>";
+  html += "</div>";
+
+  html += "</div></body></html>";
+  server.sendHeader("Content-Type", "text/html; charset=UTF-8");
+  server.send(200, "text/html", html);
+}
+
+// Обработчик 404
+void handleNotFound() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<title>Ошибка 404</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += getCSS();
+  html += "</head><body><div class='container'>";
+  html += getNavigationMenu();
+  html += "<h1>Ошибка 404</h1>";
+  html += "<p>Запрошенная страница не найдена.</p>";
+  html += "<p>URI: " + server.uri() + "</p>";
+  html += "</div></body></html>";
+  server.sendHeader("Content-Type", "text/html; charset=UTF-8");
+  server.send(404, "text/html", html);
+}
+
+
+// --- Функции датчиков и MQTT ---
+
+// Чтение датчиков
+void readSensors() {
+    // Чтение pH
+    long phSum = 0;
+    for(int i=0; i<ARRAY_LENGTH; i++) {
+        phArray[phArrayIndex] = analogRead(phPin);
+        phSum += phArray[phArrayIndex];
+        phArrayIndex = (phArrayIndex + 1) % ARRAY_LENGTH;
+        delay(1);
+    }
+    float phAvg = (float)phSum / ARRAY_LENGTH;
+    sensorValues.phRaw = phAvg;
+
+    // !! ВАЖНО: Адаптируйте формулу под ваш модуль pH !!
+    float phVoltage = phAvg * (VCC / 4095.0);
+    // Пример: sensorValues.phValue = 7.0 - (phVoltage - 2.5) / 0.059;
+    // Используем простую линейную для примера, ЗАМЕНИТЕ:
+     sensorValues.phValue = map(phAvg, 0, 4095, 0, 14);
+    // Применяем калибровку
+     sensorValues.phValue = (sensorValues.phValue - settings.calibration.phOffset) * settings.calibration.phScale;
+
+    // Чтение ORP
+    long orpSum = 0;
+    for(int i=0; i<ARRAY_LENGTH; i++) {
+        orpArray[orpArrayIndex] = analogRead(orpPin);
+        orpSum += orpArray[orpArrayIndex];
+        orpArrayIndex = (orpArrayIndex + 1) % ARRAY_LENGTH;
+        delay(1);
+    }
+     float orpAvg = (float)orpSum / ARRAY_LENGTH;
+     sensorValues.orpRaw = orpAvg;
+
+    // !! ВАЖНО: Адаптируйте формулу под ваш модуль ORP !!
+    // Пример: float orpVoltage = orpAvg * (VCC / 4095.0); sensorValues.orpValue = (orpVoltage - 1.5) * 1000.0;
+    // Используем простую линейную для примера, ЗАМЕНИТЕ:
+     sensorValues.orpValue = (orpAvg - 2048.0) * (VCC / 4095.0) * 1000.0;
+    // Применяем калибровку
+     sensorValues.orpValue = (sensorValues.orpValue - settings.calibration.orpOffset) * settings.calibration.orpScale;
+
+    Serial.printf("Readings: pH Raw: %.0f, pH: %.2f | ORP Raw: %.0f, ORP: %.1f mV\n",
+                  sensorValues.phRaw, sensorValues.phValue,
+                  sensorValues.orpRaw, sensorValues.orpValue);
+}
+
+// Публикация данных в MQTT
+void publishSensorData() {
+  if (!mqttClient.connected()) {
+    // Serial.println(F("MQTT not connected, skipping publish.")); // Можно раскомментировать для отладки
+    return;
+  }
+
+  StaticJsonDocument<128> doc;
+  doc["ph"] = round(sensorValues.phValue * 100.0) / 100.0;
+  doc["orp"] = round(sensorValues.orpValue * 10.0) / 10.0;
+
+  String topic = "sensor/" + String(settings.deviceName) + "/state";
+  char buffer[128];
+  size_t len = serializeJson(doc, buffer);
+
+  // Serial.printf("Publishing to MQTT topic: %s\n", topic.c_str()); // Можно раскомментировать для отладки
+  if (!mqttClient.publish(topic.c_str(), buffer, len)) {
+      Serial.println(F("MQTT publish FAILED"));
+  }
 } 
