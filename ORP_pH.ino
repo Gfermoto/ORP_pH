@@ -44,7 +44,7 @@ String getAPConfigPage() {
   // Формируем HTML-страницу с настройками
   String html = "<!DOCTYPE html><html><head>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>ESP32 ORP/pH Configuration</title>";
+  html += "<title>Eyera ORP/pH sensor</title>";
   html += "<style>";
   html += "body{font-family:Arial,sans-serif;margin:20px;background-color:#f5f5f5;}";
   html += "h1{color:#0066cc;}";
@@ -60,7 +60,7 @@ String getAPConfigPage() {
   html += "</style>";
   html += "</head><body>";
   html += "<div class='container'>";
-  html += "<h1>ESP32 ORP/pH Configuration - " + deviceName + "</h1>";
+  html += "<h1>Eyera ORP/pH sensor</h1>";
   
   // Секция настроек WiFi
   html += "<div class='section'>";
