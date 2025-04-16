@@ -45,6 +45,10 @@ void handleRoot() {
 
 // Обработчик для OTA обновления
 void handleOTAUpdate() {
+  Serial.println("=== OTA Update Handler ===");
+  Serial.println("Current version: v1.0.1");
+  Serial.println("Starting OTA update process...");
+  
   HTTPUpload& upload = server.upload();
   static bool updateStarted = false;
   static size_t totalSize = 0;
