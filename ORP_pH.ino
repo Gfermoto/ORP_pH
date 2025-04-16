@@ -98,6 +98,7 @@ void handleOTAUpdate() {
       }
       
       // Начинаем обновление с указанием размера и флагами
+      // U_FLASH - обновляем только прошивку, не трогая данные в NVS
       if (!Update.begin(totalSize, U_FLASH)) {
         Serial.printf("Update begin failed: ");
         Update.printError(Serial);
