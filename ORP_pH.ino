@@ -74,24 +74,26 @@ String getAPConfigPage() {
   html += "</form>";
   html += "</div>";
   
-  // Секция настроек MQTT
-  html += "<div class='section'>";
-  html += "<h2>MQTT Settings</h2>";
-  html += "<form action='/save-mqtt' method='POST'>";
-  html += "<label><input type='checkbox' name='mqtt_enabled' " + String(mqtt_enabled ? "checked" : "") + "> Enable MQTT</label>";
-  html += "<label for='mqtt_server'>MQTT Server:</label>";
-  html += "<input type='text' name='mqtt_server' value='" + mqtt_server + "'>";
-  html += "<label for='mqtt_port'>MQTT Port:</label>";
-  html += "<input type='number' name='mqtt_port' value='" + mqtt_port + "'>";
-  html += "<label for='mqtt_user'>MQTT Username:</label>";
-  html += "<input type='text' name='mqtt_user' value='" + mqtt_user + "'>";
-  html += "<label for='mqtt_password'>MQTT Password:</label>";
-  html += "<input type='password' name='mqtt_password' value='" + mqtt_password + "'>";
-  html += "<label for='mqtt_topic'>MQTT Topic:</label>";
-  html += "<input type='text' name='mqtt_topic' value='" + mqtt_topic + "'>";
-  html += "<input type='submit' value='Save MQTT Settings'>";
-  html += "</form>";
-  html += "</div>";
+  // Секция настроек MQTT - показываем только в режиме клиента (не в режиме точки доступа)
+  if (!ap_mode) {
+    html += "<div class='section'>";
+    html += "<h2>MQTT Settings</h2>";
+    html += "<form action='/save-mqtt' method='POST'>";
+    html += "<label><input type='checkbox' name='mqtt_enabled' " + String(mqtt_enabled ? "checked" : "") + "> Enable MQTT</label>";
+    html += "<label for='mqtt_server'>MQTT Server:</label>";
+    html += "<input type='text' name='mqtt_server' value='" + mqtt_server + "'>";
+    html += "<label for='mqtt_port'>MQTT Port:</label>";
+    html += "<input type='number' name='mqtt_port' value='" + mqtt_port + "'>";
+    html += "<label for='mqtt_user'>MQTT Username:</label>";
+    html += "<input type='text' name='mqtt_user' value='" + mqtt_user + "'>";
+    html += "<label for='mqtt_password'>MQTT Password:</label>";
+    html += "<input type='password' name='mqtt_password' value='" + mqtt_password + "'>";
+    html += "<label for='mqtt_topic'>MQTT Topic:</label>";
+    html += "<input type='text' name='mqtt_topic' value='" + mqtt_topic + "'>";
+    html += "<input type='submit' value='Save MQTT Settings'>";
+    html += "</form>";
+    html += "</div>";
+  }
   
   // Добавляем кнопку сброса настроек только в режиме клиента (станции)
   if (!ap_mode) {
