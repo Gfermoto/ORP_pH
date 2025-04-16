@@ -7,7 +7,7 @@
 
 // Константы и параметры
 #define BOOT_BUTTON 0   // GPIO0 для кнопки BOOT
-#define LED_PIN     2   // Светодиод индикации (обычно GPIO2 на большинстве ESP32)
+#define LED_PIN     2   // Светодиод индикации (GPIO2)
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
 String deviceName = ""; // Полное имя устройства с MAC
 const byte DNS_PORT = 53;
@@ -49,12 +49,30 @@ void handleOTAUpdate() {
   static bool updateStarted = false;
   static size_t totalSize = 0;
   
+  Serial.println("OTA Update handler called");
+  Serial.printf("Upload status: %d\n", upload.status);
+  Serial.printf("Upload filename: %s\n", upload.filename.c_str());
+  Serial.printf("Upload name: %s\n", upload.name.c_str());
+  Serial.printf("Upload type: %s\n", upload.type.c_str());
+  Serial.printf("Upload totalSize: %u\n", upload.totalSize);
+  Serial.printf("Upload currentSize: %u\n", upload.currentSize);
+  
   if (upload.status == UPLOAD_FILE_START) {
     if (isUpdating) {
       Serial.println("Update already in progress");
       server.send(500, "text/plain", "Update already in progress");
       return;
     }
+    
+    // Выводим текущие настройки
+    Serial.println("Current settings before update:");
+    Serial.println("WiFi SSID: " + ssid);
+    Serial.println("WiFi Password: " + password);
+    Serial.println("MQTT Server: " + mqtt_server);
+    Serial.println("MQTT Port: " + mqtt_port);
+    Serial.println("MQTT User: " + mqtt_user);
+    Serial.println("MQTT Topic: " + mqtt_topic);
+    Serial.println("MQTT Enabled: " + String(mqtt_enabled ? "true" : "false"));
     
     Serial.printf("Update: %s\n", upload.filename.c_str());
     Serial.printf("Starting update...\n");
@@ -97,8 +115,7 @@ void handleOTAUpdate() {
         return;
       }
       
-      // Начинаем обновление с указанием размера и флагами
-      // U_FLASH - обновляем только прошивку, не трогая данные в NVS
+      // Начинаем обновление с сохранением настроек
       if (!Update.begin(totalSize, U_FLASH)) {
         Serial.printf("Update begin failed: ");
         Update.printError(Serial);
@@ -140,19 +157,42 @@ void handleOTAUpdate() {
     Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
     
     // Завершаем обновление
-    if (Update.end(true)) {
-      Serial.printf("Update Success: %u bytes\n", totalSize);
-      Serial.println("Rebooting...");
-      server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>Update Success!</h1><p>Device will reboot in 5 seconds...</p></body></html>");
-      delay(1000);
-      ESP.restart();
-    } else {
+    if (!Update.end(true)) {
       Serial.printf("Update failed: ");
       Update.printError(Serial);
       server.send(500, "text/plain", "Update failed");
       isUpdating = false;
       updateStarted = false;
+      return;
     }
+    
+    Serial.printf("Update Success: %u bytes\n", totalSize);
+    Serial.println("Rebooting...");
+    
+    // Отправляем страницу успешного обновления
+    String successPage = "<!DOCTYPE html><html><head>";
+    successPage += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    successPage += "<title>Update Success</title>";
+    successPage += "<style>";
+    successPage += "body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;padding:0;background-color:#121212;color:#e0e0e0;}";
+    successPage += ".container{max-width:800px;margin:20px auto;padding:20px;background-color:#1e1e1e;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.3);}";
+    successPage += "h1{color:#4CAF50;margin-bottom:20px;font-size:24px;font-weight:500;}";
+    successPage += "p{color:#b0b0b0;font-size:14px;line-height:1.5;}";
+    successPage += "</style>";
+    successPage += "<meta http-equiv='refresh' content='5;url=/'></head><body>";
+    successPage += "<div class='container'>";
+    successPage += "<h1>Update Success!</h1>";
+    successPage += "<p>Firmware has been successfully updated.</p>";
+    successPage += "<p>Device will reboot in 5 seconds...</p>";
+    successPage += "</div></body></html>";
+    
+    server.send(200, "text/html", successPage);
+    
+    // Даем время на отправку ответа
+    delay(1000);
+    
+    // Перезагружаем устройство
+    ESP.restart();
   }
 }
 
@@ -161,23 +201,34 @@ String getAPConfigPage() {
   // Формируем HTML-страницу с настройками
   String html = "<!DOCTYPE html><html><head>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>Eyera ORP/pH sensor</title>";
+  html += "<title>Eyera " + deviceName + " sensor</title>";
   html += "<style>";
-  html += "body{font-family:Arial,sans-serif;margin:20px;background-color:#f5f5f5;}";
-  html += "h1{color:#0066cc;}";
-  html += ".container{background-color:white;border-radius:10px;padding:20px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
-  html += "label{display:block;margin-top:10px;font-weight:bold;}";
-  html += "input[type=text],input[type=password],input[type=number]{width:100%;padding:8px;margin:6px 0;box-sizing:border-box;border:1px solid #ddd;border-radius:4px;}";
-  html += "input[type=checkbox]{margin:10px 5px 10px 0;}";
-  html += "input[type=submit]{background-color:#0066cc;color:white;padding:10px 15px;border:none;border-radius:4px;cursor:pointer;margin-top:15px;}";
-  html += "input[type=submit]:hover{background-color:#0055bb;}";
-  html += ".section{margin-bottom:20px;border-bottom:1px solid #eee;padding-bottom:20px;}";
-  html += "input[type=submit].warning{background-color:#cc3300;}";
-  html += "input[type=submit].warning:hover{background-color:#bb2200;}";
+  html += "body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;padding:0;background-color:#121212;color:#e0e0e0;}";
+  html += ".container{max-width:800px;margin:20px auto;padding:20px;background-color:#1e1e1e;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.3);}";
+  html += "h1{color:#90caf9;margin-bottom:20px;font-size:24px;font-weight:500;}";
+  html += "h2{color:#bb86fc;margin-top:30px;margin-bottom:15px;font-size:18px;font-weight:500;border-bottom:1px solid #333;padding-bottom:10px;}";
+  html += ".section{margin-bottom:30px;padding-bottom:20px;border-bottom:1px solid #333;}";
+  html += ".section:last-child{border-bottom:none;}";
+  html += "label{display:block;margin:10px 0 5px;color:#b0b0b0;font-size:14px;}";
+  html += "input[type=text],input[type=password],input[type=number]{width:100%;padding:10px;margin:5px 0;border:1px solid #333;border-radius:4px;box-sizing:border-box;font-size:14px;background-color:#2d2d2d;color:#e0e0e0;}";
+  html += "input[type=text]:focus,input[type=password]:focus,input[type=number]:focus{border-color:#90caf9;outline:none;}";
+  html += "input[type=checkbox]{margin-right:10px;vertical-align:middle;}";
+  html += "input[type=submit]{background-color:#90caf9;color:#121212;border:none;padding:12px 20px;border-radius:4px;cursor:pointer;font-size:14px;margin-top:15px;transition:background-color 0.3s;}";
+  html += "input[type=submit]:hover{background-color:#64b5f6;}";
+  html += "input[type=submit].warning{background-color:#f44336;}";
+  html += "input[type=submit].warning:hover{background-color:#d32f2f;}";
+  html += ".checkbox-label{display:inline-block;margin:10px 0;color:#b0b0b0;font-size:14px;}";
+  html += ".info-text{color:#888;font-size:13px;margin-top:5px;}";
+  html += ".header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}";
+  html += ".header h1{margin:0;}";
+  html += ".header .version{color:#888;font-size:14px;}";
   html += "</style>";
   html += "</head><body>";
   html += "<div class='container'>";
-  html += "<h1>Eyera ORP/pH sensor</h1>";
+  html += "<div class='header'>";
+  html += "<h1>Eyera " + deviceName + " sensor</h1>";
+  html += "<span class='version'>v1.0</span>";
+  html += "</div>";
   
   // Секция настроек WiFi
   html += "<div class='section'>";
@@ -191,12 +242,12 @@ String getAPConfigPage() {
   html += "</form>";
   html += "</div>";
   
-  // Секция настроек MQTT - показываем только в режиме клиента (не в режиме точки доступа)
+  // Секция настроек MQTT - показываем только в режиме клиента
   if (!ap_mode) {
     html += "<div class='section'>";
     html += "<h2>MQTT Settings</h2>";
     html += "<form action='/save-mqtt' method='POST'>";
-    html += "<label><input type='checkbox' name='mqtt_enabled' " + String(mqtt_enabled ? "checked" : "") + "> Enable MQTT</label>";
+    html += "<label class='checkbox-label'><input type='checkbox' name='mqtt_enabled' " + String(mqtt_enabled ? "checked" : "") + "> Enable MQTT</label>";
     html += "<label for='mqtt_server'>MQTT Server:</label>";
     html += "<input type='text' name='mqtt_server' value='" + mqtt_server + "'>";
     html += "<label for='mqtt_port'>MQTT Port:</label>";
@@ -212,13 +263,13 @@ String getAPConfigPage() {
     html += "</div>";
   }
   
-  // Добавляем кнопку сброса настроек только в режиме клиента (станции)
+  // Добавляем кнопку сброса настроек только в режиме клиента
   if (!ap_mode) {
     html += "<div class='section'>";
     html += "<h2>Reset WiFi Settings</h2>";
     html += "<form action='/reset-wifi' method='POST'>";
     html += "<input type='submit' class='warning' value='Reset WiFi Settings'>";
-    html += "<p>This will erase all WiFi settings and restart the device in Access Point mode.</p>";
+    html += "<p class='info-text'>This will erase all WiFi settings and restart the device in Access Point mode.</p>";
     html += "</form>";
     html += "</div>";
 
@@ -227,9 +278,9 @@ String getAPConfigPage() {
     html += "<h2>OTA Update</h2>";
     html += "<form action='/update' method='POST' enctype='multipart/form-data'>";
     html += "<label for='update'>Select firmware file:</label>";
-    html += "<input type='file' name='update' accept='.bin' required>";
+    html += "<input type='file' name='update' id='update' accept='.bin' required>";
     html += "<input type='submit' value='Upload and Update'>";
-    html += "<p>Upload a new firmware file to update the device.</p>";
+    html += "<p class='info-text'>Upload a new firmware file to update the device.</p>";
     html += "</form>";
     html += "</div>";
   }
@@ -250,11 +301,19 @@ void handleSaveWifi() {
   ssid = server.arg("ssid");
   password = server.arg("password");
   
+  Serial.println("Saving WiFi settings:");
+  Serial.println("SSID: " + ssid);
+  Serial.println(String("Password: ") + (password.length() > 0 ? "********" : "not set"));
+  
   // Сохраняем в энергонезависимую память
   preferences.begin("wifi", false);
+  preferences.clear(); // Очищаем старые настройки
   preferences.putString("ssid", ssid);
   preferences.putString("password", password);
+  preferences.putBool("ap_mode", false); // Сохраняем режим клиента
   preferences.end();
+  
+  Serial.println("Settings saved to NVS");
   
   // Отправляем ответ пользователю
   server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings saved!</h1><p>The device will try to connect to the WiFi network.</p><p>If connection fails, the Access Point will be restarted.</p><p>Redirecting in 5 seconds...</p></body></html>");
@@ -281,8 +340,16 @@ void handleSaveMQTT() {
   mqtt_password = server.arg("mqtt_password");
   mqtt_topic = server.arg("mqtt_topic");
   
+  Serial.println("Saving MQTT settings:");
+  Serial.println("Enabled: " + String(mqtt_enabled ? "true" : "false"));
+  Serial.println("Server: " + mqtt_server);
+  Serial.println("Port: " + mqtt_port);
+  Serial.println("User: " + mqtt_user);
+  Serial.println("Topic: " + mqtt_topic);
+  
   // Сохраняем в энергонезависимую память
   preferences.begin("mqtt", false);
+  preferences.clear(); // Очищаем старые настройки
   preferences.putBool("enabled", mqtt_enabled);
   preferences.putString("server", mqtt_server);
   preferences.putString("port", mqtt_port);
@@ -290,6 +357,8 @@ void handleSaveMQTT() {
   preferences.putString("password", mqtt_password);
   preferences.putString("topic", mqtt_topic);
   preferences.end();
+  
+  Serial.println("MQTT settings saved to NVS");
   
   // Отправляем ответ пользователю
   server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
@@ -336,6 +405,7 @@ void setupWifi() {
   preferences.begin("wifi", true);
   ssid = preferences.getString("ssid", "");
   password = preferences.getString("password", "");
+  ap_mode = preferences.getBool("ap_mode", true); // Читаем сохраненный режим
   preferences.end();
   
   // Читаем настройки MQTT
@@ -356,15 +426,13 @@ void setupWifi() {
     sprintf(macStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
     deviceName = String(DEVICE_PREFIX) + String(macStr);
     mqtt_client_id = deviceName; // Устанавливаем ID клиента MQTT
-    Serial.println("Device name: " + deviceName);
-    Serial.println("MQTT Client ID: " + mqtt_client_id);
   }
   
   // Устанавливаем имя хоста
   WiFi.setHostname(deviceName.c_str());
   
   // Режим работы в зависимости от наличия настроек
-  if (ssid.length() > 0 && !ap_mode) {
+  if (ssid.length() > 0) {
     // Клиентский режим
     Serial.println("Connecting to WiFi: " + ssid);
     WiFi.mode(WIFI_STA);
@@ -382,6 +450,7 @@ void setupWifi() {
       Serial.println("");
       Serial.println("WiFi connected");
       Serial.println("IP address: " + WiFi.localIP().toString());
+      ap_mode = false;
     } else {
       Serial.println("");
       Serial.println("Failed to connect to WiFi");
@@ -514,6 +583,36 @@ void setup() {
   // Инициализация последовательного порта для отладки
   Serial.begin(115200);
   Serial.println("Starting ESP32 ORP/pH Device");
+  
+  // Даем время на инициализацию NVS
+  delay(100);
+  
+  // Читаем и выводим настройки WiFi
+  preferences.begin("wifi", true);
+  ssid = preferences.getString("ssid", "");
+  password = preferences.getString("password", "");
+  preferences.end();
+  
+  Serial.println("Current WiFi settings:");
+  Serial.println("SSID: " + ssid);
+  Serial.println(String("Password: ") + (password.length() > 0 ? "********" : "not set"));
+  
+  // Читаем и выводим настройки MQTT
+  preferences.begin("mqtt", true);
+  mqtt_enabled = preferences.getBool("enabled", false);
+  mqtt_server = preferences.getString("server", "");
+  mqtt_port = preferences.getString("port", "1883");
+  mqtt_user = preferences.getString("user", "");
+  mqtt_password = preferences.getString("password", "");
+  mqtt_topic = preferences.getString("topic", "sensors/orp_ph");
+  preferences.end();
+  
+  Serial.println("Current MQTT settings:");
+  Serial.println("Enabled: " + String(mqtt_enabled ? "true" : "false"));
+  Serial.println("Server: " + mqtt_server);
+  Serial.println("Port: " + mqtt_port);
+  Serial.println("User: " + mqtt_user);
+  Serial.println("Topic: " + mqtt_topic);
   
   // Выводим информацию о памяти
   Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
