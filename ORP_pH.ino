@@ -24,6 +24,7 @@ String mqtt_user = "";    // Имя пользователя MQTT
 String mqtt_password = ""; // Пароль MQTT
 String mqtt_topic = "sensors/orp_ph"; // Топик MQTT
 bool mqtt_enabled = false; // Включен ли MQTT
+String mqtt_client_id = ""; // ID клиента MQTT (будет установлен как имя устройства)
 
 // Режим работы: true - точка доступа, false - клиент
 bool ap_mode = true;
@@ -227,7 +228,9 @@ void setupWifi() {
     char macStr[7];
     sprintf(macStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
     deviceName = String(DEVICE_PREFIX) + String(macStr);
+    mqtt_client_id = deviceName; // Устанавливаем ID клиента MQTT
     Serial.println("Device name: " + deviceName);
+    Serial.println("MQTT Client ID: " + mqtt_client_id);
   }
   
   // Устанавливаем имя хоста
