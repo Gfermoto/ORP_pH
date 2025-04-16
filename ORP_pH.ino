@@ -2,6 +2,8 @@
 #include <WebServer.h>    // Библиотека для создания веб-сервера
 #include <DNSServer.h>    // Библиотека для DNS-сервера (перенаправление на страницу настройки)
 #include <Preferences.h>  // Библиотека для хранения настроек в энергонезависимой памяти
+#include <Update.h>       // Библиотека для OTA обновления
+#include <HTTPUpdate.h>   // Библиотека для HTTP OTA обновления
 
 // Константы и параметры
 #define BOOT_BUTTON 0   // GPIO0 для кнопки BOOT
@@ -33,11 +35,124 @@ bool ap_mode = true;
 bool ledState = false;          // Текущее состояние светодиода
 bool isConnected = false;       // Флаг подключения к сети или клиента к AP
 bool isResetting = false;       // Флаг процесса сброса
+bool isUpdating = false;        // Флаг процесса OTA обновления
 unsigned long ledLastToggle = 0; // Время последнего переключения светодиода
 
 // Обработка страницы конфигурации
 void handleRoot() {
   server.send(200, "text/html", getAPConfigPage());
+}
+
+// Обработчик для OTA обновления
+void handleOTAUpdate() {
+  HTTPUpload& upload = server.upload();
+  static bool updateStarted = false;
+  static size_t totalSize = 0;
+  
+  if (upload.status == UPLOAD_FILE_START) {
+    if (isUpdating) {
+      Serial.println("Update already in progress");
+      server.send(500, "text/plain", "Update already in progress");
+      return;
+    }
+    
+    Serial.printf("Update: %s\n", upload.filename.c_str());
+    Serial.printf("Starting update...\n");
+    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+    
+    // Проверяем, что это бинарный файл
+    if (upload.filename.indexOf(".bin") == -1) {
+      Serial.println("Error: Not a binary file");
+      server.send(500, "text/plain", "Error: Not a binary file");
+      return;
+    }
+    
+    isUpdating = true;
+    updateStarted = false;
+    totalSize = 0;
+    Serial.println("Waiting for file upload...");
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!isUpdating) {
+      Serial.println("Update not started");
+      server.send(500, "text/plain", "Update not started");
+      return;
+    }
+    
+    // Накапливаем общий размер
+    totalSize += upload.currentSize;
+    Serial.printf("Received chunk: %u bytes, total: %u bytes\n", upload.currentSize, totalSize);
+    
+    // Если обновление еще не начато и мы получили достаточно данных
+    if (!updateStarted && totalSize > 1024) {
+      Serial.printf("Starting update, received size: %u bytes\n", totalSize);
+      Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+      Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+      
+      // Проверяем, что файл не слишком большой
+      if (totalSize > (ESP.getFreeSketchSpace() - 0x1000)) {
+        Serial.printf("Error: File too large (%u > %u)\n", totalSize, ESP.getFreeSketchSpace() - 0x1000);
+        server.send(500, "text/plain", "Error: File too large");
+        isUpdating = false;
+        return;
+      }
+      
+      // Начинаем обновление с указанием размера и флагами
+      if (!Update.begin(totalSize, U_FLASH)) {
+        Serial.printf("Update begin failed: ");
+        Update.printError(Serial);
+        server.send(500, "text/plain", "Update begin failed");
+        isUpdating = false;
+        return;
+      }
+      updateStarted = true;
+      Serial.printf("Update begin successful, size: %u bytes\n", totalSize);
+    }
+    
+    // Если обновление начато, записываем данные
+    if (updateStarted) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Serial.printf("Update write failed: ");
+        Update.printError(Serial);
+        server.send(500, "text/plain", "Update write failed");
+        isUpdating = false;
+        updateStarted = false;
+        return;
+      }
+      
+      // Выводим прогресс
+      static uint8_t lastProgress = 0;
+      uint8_t currentProgress = (totalSize * 100) / upload.totalSize;
+      if (currentProgress != lastProgress) {
+        lastProgress = currentProgress;
+        Serial.printf("Progress: %u%% (%u/%u bytes)\n", currentProgress, totalSize, upload.totalSize);
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!isUpdating || !updateStarted) {
+      Serial.println("Update not started");
+      server.send(500, "text/plain", "Update not started");
+      return;
+    }
+    
+    Serial.printf("Update file end, total size: %u bytes\n", totalSize);
+    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+    
+    // Завершаем обновление
+    if (Update.end(true)) {
+      Serial.printf("Update Success: %u bytes\n", totalSize);
+      Serial.println("Rebooting...");
+      server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>Update Success!</h1><p>Device will reboot in 5 seconds...</p></body></html>");
+      delay(1000);
+      ESP.restart();
+    } else {
+      Serial.printf("Update failed: ");
+      Update.printError(Serial);
+      server.send(500, "text/plain", "Update failed");
+      isUpdating = false;
+      updateStarted = false;
+    }
+  }
 }
 
 // Страница конфигурации точки доступа и WiFi
@@ -103,6 +218,17 @@ String getAPConfigPage() {
     html += "<form action='/reset-wifi' method='POST'>";
     html += "<input type='submit' class='warning' value='Reset WiFi Settings'>";
     html += "<p>This will erase all WiFi settings and restart the device in Access Point mode.</p>";
+    html += "</form>";
+    html += "</div>";
+
+    // Добавляем секцию OTA обновления только в режиме клиента
+    html += "<div class='section'>";
+    html += "<h2>OTA Update</h2>";
+    html += "<form action='/update' method='POST' enctype='multipart/form-data'>";
+    html += "<label for='update'>Select firmware file:</label>";
+    html += "<input type='file' name='update' accept='.bin' required>";
+    html += "<input type='submit' value='Upload and Update'>";
+    html += "<p>Upload a new firmware file to update the device.</p>";
     html += "</form>";
     html += "</div>";
   }
@@ -300,6 +426,9 @@ void setupServer() {
   server.on("/save-wifi", HTTP_POST, handleSaveWifi);
   server.on("/save-mqtt", HTTP_POST, handleSaveMQTT);
   server.on("/reset-wifi", HTTP_POST, handleResetWifi);
+  server.on("/update", HTTP_POST, []() {
+    server.send(200, "text/plain", "Update Success!");
+  }, handleOTAUpdate);
   
   // Обработчик для всех остальных URL, чтобы избежать ошибок 404
   server.onNotFound([]() {
@@ -385,6 +514,12 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Starting ESP32 ORP/pH Device");
   
+  // Выводим информацию о памяти
+  Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+  Serial.printf("Sketch size: %u bytes\n", ESP.getSketchSize());
+  Serial.printf("Flash size: %u bytes\n", ESP.getFlashChipSize());
+  
   // Настройка кнопки BOOT и светодиода
   pinMode(BOOT_BUTTON, INPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -395,6 +530,16 @@ void setup() {
   
   // Настройка веб-сервера
   setupServer();
+  
+  // Инициализация OTA
+  Update.onProgress([](size_t progress, size_t total) {
+    static uint8_t lastProgress = 0;
+    uint8_t currentProgress = (progress * 100) / total;
+    if (currentProgress != lastProgress) {
+      lastProgress = currentProgress;
+      Serial.printf("OTA Progress: %u%%\n", currentProgress);
+    }
+  });
   
   Serial.println("Setup completed");
 }
