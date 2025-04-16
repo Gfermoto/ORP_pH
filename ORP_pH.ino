@@ -9,6 +9,7 @@
 #define BOOT_BUTTON 0   // GPIO0 для кнопки BOOT
 #define LED_PIN     2   // Светодиод индикации (GPIO2)
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
+const char* VERSION = "v1.0.1"; // Версия прошивки
 String deviceName = ""; // Полное имя устройства с MAC
 const byte DNS_PORT = 53;
 
@@ -231,7 +232,7 @@ String getAPConfigPage() {
   html += "<div class='container'>";
   html += "<div class='header'>";
   html += "<h1>Eyera " + deviceName + " sensor</h1>";
-  html += "<span class='version'>v1.0.1</span>";
+  html += "<span class='version'>" + String(VERSION) + "</span>";
   html += "</div>";
   
   // Секция настроек WiFi
@@ -587,6 +588,7 @@ void setup() {
   // Инициализация последовательного порта для отладки
   Serial.begin(115200);
   Serial.println("Starting ESP32 ORP/pH Device");
+  Serial.println("Version: " + String(VERSION));
   
   // Даем время на инициализацию NVS
   delay(100);
