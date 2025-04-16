@@ -227,7 +227,7 @@ String getAPConfigPage() {
   html += "<div class='container'>";
   html += "<div class='header'>";
   html += "<h1>Eyera " + deviceName + " sensor</h1>";
-  html += "<span class='version'>v1.0</span>";
+  html += "<span class='version'>v1.0.1</span>";
   html += "</div>";
   
   // Секция настроек WiFi
