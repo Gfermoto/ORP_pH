@@ -1,5 +1,6 @@
 #include <WiFi.h>        // Библиотека для работы с WiFi
-#include <WebServer.h>   // Веб-сервер
+#include <AsyncTCP.h>    // Асинхронный TCP для ESP32
+#include <ESPAsyncWebServer.h> // Асинхронный веб-сервер
 #include <Preferences.h>  // Хранение настроек в NVS
 #include <DNSServer.h>    // DNS-сервер для режима точки доступа
 #include <ESPmDNS.h>     // Для OTA
@@ -13,10 +14,10 @@
 #define DNS_PORT    53  // Порт DNS сервера
 #define DEBUG_MODE false // Режим отладки
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
-const char* VERSION = "v1.2.1b"; // Версия прошивки
+const char* VERSION = "v1.2.2"; // Версия прошивки
 
 // Объекты для работы
-WebServer server(80);
+AsyncWebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
 WiFiClient wifiClient;
@@ -165,8 +166,8 @@ String getMqttStatus() {
 }
 
 // Обработка страницы конфигурации
-void handleRoot() {
-  server.send(200, "text/html", getAPConfigPage());
+void handleRoot(AsyncWebServerRequest *request) {
+  request->send(200, "text/html", getAPConfigPage());
 }
 
 // Улучшенная функция сохранения настроек
@@ -372,297 +373,108 @@ String getAPConfigPage() {
   return html;
 }
 
-// Обработчики для сохранения настроек
-void handleSaveWifi() {
-  // Проверяем метод запроса
-  if (server.method() != HTTP_POST) {
-    server.send(405, "text/plain", "Method Not Allowed");
-    return;
+// Обработчик сохранения WiFi настроек
+void handleSaveWifi(AsyncWebServerRequest *request) {
+  if (request->hasParam("ssid", true) && request->hasParam("password", true)) {
+    ssid = request->getParam("ssid", true)->value();
+    password = request->getParam("password", true)->value();
+    
+    // Сохраняем настройки
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", password);
+    preferences.putBool("ap_mode", false);
+    preferences.end();
+    
+    // Отправляем ответ
+    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings saved!</h1><p>The device will try to connect to the WiFi network.</p><p>If connection fails, the Access Point will be restarted.</p><p>Redirecting in 5 seconds...</p></body></html>");
+    
+    // Перезапускаем WiFi
+    ap_mode = false;
+    WiFi.disconnect();
+    delay(1000);
+    setupWifi();
+  } else {
+    request->send(400, "text/plain", "Missing parameters");
   }
-  
-  // Получаем значения из формы
-  ssid = server.arg("ssid");
-  password = server.arg("password");
-  
-  Serial.println("Saving WiFi settings:");
-  Serial.println("SSID: " + ssid);
-  Serial.println(String("Password: ") + (password.length() > 0 ? "********" : "not set"));
-  
-  // Сохраняем в энергонезависимую память
-  preferences.begin("wifi", false);
-  preferences.clear(); // Очищаем старые настройки
-  preferences.putString("ssid", ssid);
-  preferences.putString("password", password);
-  preferences.putBool("ap_mode", false); // Сохраняем режим клиента
-  preferences.end();
-  
-  Serial.println("Settings saved to NVS");
-  
-  // Отправляем ответ пользователю
-  server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings saved!</h1><p>The device will try to connect to the WiFi network.</p><p>If connection fails, the Access Point will be restarted.</p><p>Redirecting in 5 seconds...</p></body></html>");
-  
-  // Переходим в режим клиента
-  ap_mode = false;
-  WiFi.disconnect();
-  delay(1000);
-  setupWifi();
 }
 
-void handleSaveMQTT() {
-  // Проверяем метод запроса
-  if (server.method() != HTTP_POST) {
-    server.send(405, "text/plain", "Method Not Allowed");
-    return;
+// Обработчик сохранения MQTT настроек
+void handleSaveMQTT(AsyncWebServerRequest *request) {
+  if (request->hasParam("mqtt_server", true) && request->hasParam("mqtt_port", true)) {
+    mqtt_enabled = request->hasParam("mqtt_enabled", true);
+    mqtt_server = request->getParam("mqtt_server", true)->value();
+    mqtt_port = request->getParam("mqtt_port", true)->value();
+    mqtt_user = request->getParam("mqtt_user", true)->value();
+    mqtt_password = request->getParam("mqtt_password", true)->value();
+    mqtt_prefix = request->getParam("mqtt_prefix", true)->value();
+    
+    // Сохраняем настройки
+    preferences.begin("mqtt", false);
+    preferences.clear();
+    preferences.putBool("enabled", mqtt_enabled);
+    preferences.putString("server", mqtt_server);
+    preferences.putString("port", mqtt_port);
+    preferences.putString("user", mqtt_user);
+    preferences.putString("password", mqtt_password);
+    preferences.putString("prefix", mqtt_prefix);
+    preferences.end();
+    
+    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
+  } else {
+    request->send(400, "text/plain", "Missing parameters");
   }
-  
-  // Получаем значения из формы
-  mqtt_enabled = server.hasArg("mqtt_enabled");
-  mqtt_server = server.arg("mqtt_server");
-  mqtt_port = server.arg("mqtt_port");
-  mqtt_user = server.arg("mqtt_user");
-  mqtt_password = server.arg("mqtt_password");
-  mqtt_prefix = server.arg("mqtt_prefix");
-  
-  Serial.println("Saving MQTT settings:");
-  Serial.println("Enabled: " + String(mqtt_enabled ? "true" : "false"));
-  Serial.println("Server: " + mqtt_server);
-  Serial.println("Port: " + mqtt_port);
-  Serial.println("User: " + mqtt_user);
-  Serial.println("Prefix: " + mqtt_prefix);
-  
-  // Сохраняем в энергонезависимую память
-  preferences.begin("mqtt", false);
-  preferences.clear(); // Очищаем старые настройки
-  preferences.putBool("enabled", mqtt_enabled);
-  preferences.putString("server", mqtt_server);
-  preferences.putString("port", mqtt_port);
-  preferences.putString("user", mqtt_user);
-  preferences.putString("password", mqtt_password);
-  preferences.putString("prefix", mqtt_prefix);
-  preferences.end();
-  
-  Serial.println("MQTT settings saved to NVS");
-  
-  // Отправляем ответ пользователю
-  server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
 }
 
 // Обработчик сброса WiFi настроек
-void handleResetWifi() {
-  Serial.println("Received WiFi reset request via web interface");
-  server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings have been reset!</h1><p>The device will restart as an Access Point.</p><p>Redirecting in 5 seconds...</p></body></html>");
+void handleResetWifi(AsyncWebServerRequest *request) {
+  request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings have been reset!</h1><p>The device will restart as an Access Point.</p><p>Redirecting in 5 seconds...</p></body></html>");
   delay(1000);
   resetWiFiSettings();
 }
 
-// Функция сброса WiFi настроек
-void resetWiFiSettings() {
-  Serial.println("Resetting WiFi settings...");
-  
-  // Включаем режим быстрого мигания светодиода
-  isResetting = true;
-  
-  // Удаляем настройки WiFi из памяти
-  preferences.begin("wifi", false);
-  preferences.clear();
-  preferences.end();
-  
-  // Сбрасываем переменные
-  ssid = "";
-  password = "";
-  
-  // Перезапускаем ESP в режиме точки доступа
-  ap_mode = true;
-  WiFi.disconnect();
-  delay(1000);
-  
-  // Отключаем режим быстрого мигания
-  isResetting = false;
-  
-  setupWifi();
-}
-
-// Настройка WiFi (точка доступа или клиент)
-void setupWifi() {
-  // Читаем сохраненные настройки
-  preferences.begin("wifi", true);
-  ssid = preferences.getString("ssid", "");
-  password = preferences.getString("password", "");
-  ap_mode = preferences.getBool("ap_mode", true); // Читаем сохраненный режим
-  preferences.end();
-  
-  // Читаем настройки MQTT
-  preferences.begin("mqtt", true);
-  mqtt_enabled = preferences.getBool("enabled", false);
-  mqtt_server = preferences.getString("server", "");
-  mqtt_port = preferences.getString("port", "1883");
-  mqtt_user = preferences.getString("user", "");
-  mqtt_password = preferences.getString("password", "");
-  mqtt_prefix = preferences.getString("prefix", "homeassistant");
-  preferences.end();
-  
-  // Получаем MAC адрес и формируем имя устройства, если еще не сформировано
-  if (deviceName == "") {
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    char macStr[7];
-    sprintf(macStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
-    deviceName = String(DEVICE_PREFIX) + String(macStr);
-    mqtt_client_id = deviceName; // Устанавливаем ID клиента MQTT
-  }
-  
-  // Устанавливаем имя хоста
-  WiFi.setHostname(deviceName.c_str());
-  
-  // Режим работы в зависимости от наличия настроек
-  if (ssid.length() > 0) {
-    // Клиентский режим
-    Serial.println("Connecting to WiFi: " + ssid);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), password.c_str());
-    
-    // Пытаемся подключиться с ограничением по времени
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("");
-      Serial.println("WiFi connected");
-      Serial.println("IP address: " + WiFi.localIP().toString());
-      ap_mode = false;
-    } else {
-      Serial.println("");
-      Serial.println("Failed to connect to WiFi");
-      startAPMode(); // Если не удалось подключиться, запускаем точку доступа
-    }
-  } else {
-    // Режим точки доступа
-    startAPMode();
-  }
-}
-
-// Запуск режима точки доступа
-void startAPMode() {
-  Serial.println("Starting Access Point Mode");
-  WiFi.mode(WIFI_AP);
-  
-  // Получаем MAC адрес и формируем имя устройства
-  if (deviceName == "") {
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    char macStr[7];
-    sprintf(macStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
-    deviceName = String(DEVICE_PREFIX) + String(macStr);
-    Serial.println("Device name: " + deviceName);
-  }
-  
-  // Запускаем открытую точку доступа (без пароля)
-  WiFi.softAP(deviceName.c_str());
-  
-  Serial.println("AP started");
-  Serial.println("AP IP address: " + WiFi.softAPIP().toString());
-  
-  // Запускаем DNS сервер для перенаправления на веб-интерфейс
-  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  ap_mode = true;
-  isConnected = false;  // Сбрасываем флаг подключения
+// Обработчик статуса MQTT
+void handleMqttStatus(AsyncWebServerRequest *request) {
+  String status = getMqttStatus();
+  String json = "{\"status\":\"" + status + "\"}";
+  request->send(200, "application/json", json);
 }
 
 // Настройка веб-сервера
 void setupServer() {
   Serial.println("\nSetting up web server...");
   
-  // Регистрируем обработчики для разных URL
+  // Регистрируем обработчики
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/save-wifi", HTTP_POST, handleSaveWifi);
+  server.on("/save-mqtt", HTTP_POST, handleSaveMQTT);
+  server.on("/reset-wifi", HTTP_POST, handleResetWifi);
+  server.on("/mqtt-status", HTTP_GET, handleMqttStatus);
   
   // Обработчик OTA обновления
-  server.on("/update", HTTP_POST, []() {
-    server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>Update complete!</h1><p>Device will restart in 5 seconds...</p></body></html>");
+  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>Update complete!</h1><p>Device will restart in 5 seconds...</p></body></html>");
     delay(1000);
     ESP.restart();
-  }, []() {
-    HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) {
-      Serial.printf("Update: %s\n", upload.filename.c_str());
+  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
+    if (!index) {
+      Serial.printf("Update: %s\n", filename.c_str());
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
         Update.printError(Serial);
       }
-    } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Update.printError(Serial);
-      }
-    } else if (upload.status == UPLOAD_FILE_END) {
+    }
+    if (Update.write(data, len) != len) {
+      Update.printError(Serial);
+    }
+    if (final) {
       if (Update.end(true)) {
-        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+        Serial.printf("Update Success: %u\nRebooting...\n", index + len);
       } else {
         Update.printError(Serial);
       }
     }
   });
-  
-  server.on("/save-wifi", HTTP_POST, [](){
-    if (server.hasArg("ssid") && server.hasArg("password")) {
-      ssid = server.arg("ssid");
-      password = server.arg("password");
-      
-      // Сохраняем настройки
-      preferences.begin("wifi", false);
-      preferences.clear();
-      preferences.putString("ssid", ssid);
-      preferences.putString("password", password);
-      preferences.putBool("ap_mode", false);
-      preferences.end();
-      
-      // Отправляем ответ
-      server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings saved!</h1><p>The device will try to connect to the WiFi network.</p><p>If connection fails, the Access Point will be restarted.</p><p>Redirecting in 5 seconds...</p></body></html>");
-      
-      // Перезапускаем WiFi
-      ap_mode = false;
-      WiFi.disconnect();
-      delay(1000);
-      setupWifi();
-    } else {
-      server.send(400, "text/plain", "Missing parameters");
-    }
-  });
-  
-  server.on("/save-mqtt", HTTP_POST, [](){
-    if (server.hasArg("mqtt_server") && server.hasArg("mqtt_port")) {
-      mqtt_enabled = server.hasArg("mqtt_enabled");
-      mqtt_server = server.arg("mqtt_server");
-      mqtt_port = server.arg("mqtt_port");
-      mqtt_user = server.arg("mqtt_user");
-      mqtt_password = server.arg("mqtt_password");
-      mqtt_prefix = server.arg("mqtt_prefix");
-      
-      // Сохраняем настройки
-      preferences.begin("mqtt", false);
-      preferences.clear();
-      preferences.putBool("enabled", mqtt_enabled);
-      preferences.putString("server", mqtt_server);
-      preferences.putString("port", mqtt_port);
-      preferences.putString("user", mqtt_user);
-      preferences.putString("password", mqtt_password);
-      preferences.putString("prefix", mqtt_prefix);
-      preferences.end();
-      
-      server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
-    } else {
-      server.send(400, "text/plain", "Missing parameters");
-    }
-  });
-  
-  server.on("/reset-wifi", HTTP_POST, [](){
-    server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings have been reset!</h1><p>The device will restart as an Access Point.</p><p>Redirecting in 5 seconds...</p></body></html>");
-    delay(1000);
-    resetWiFiSettings();
-  });
-  
-  server.on("/mqtt-status", HTTP_GET, handleMqttStatus);
   
   server.begin();
   Serial.println("Web server started");
@@ -873,13 +685,6 @@ bool checkWiFiConnection() {
   return true;
 }
 
-// Добавляем обработчик для получения статуса MQTT
-void handleMqttStatus() {
-  String status = getMqttStatus();
-  String json = "{\"status\":\"" + status + "\"}";
-  server.send(200, "application/json", json);
-}
-
 // Функция для отправки данных в MQTT
 void sendMqttData() {
   if (!mqttClient.connected()) {
@@ -1033,11 +838,10 @@ void loop() {
     }
   }
   
-  // Обработка DNS и HTTP запросов
+  // Обработка DNS запросов
   if (ap_mode) {
     dnsServer.processNextRequest();
   }
-  server.handleClient();
   
   // Обработка OTA (только в режиме клиента)
   if (!ap_mode) {
@@ -1046,4 +850,121 @@ void loop() {
   
   // Даем время другим задачам
   yield();
+}
+
+// Функция сброса WiFi настроек
+void resetWiFiSettings() {
+  Serial.println("Resetting WiFi settings...");
+  
+  // Включаем режим быстрого мигания светодиода
+  isResetting = true;
+  
+  // Удаляем настройки WiFi из памяти
+  preferences.begin("wifi", false);
+  preferences.clear();
+  preferences.end();
+  
+  // Сбрасываем переменные
+  ssid = "";
+  password = "";
+  
+  // Перезапускаем ESP в режиме точки доступа
+  ap_mode = true;
+  WiFi.disconnect();
+  delay(1000);
+  
+  // Отключаем режим быстрого мигания
+  isResetting = false;
+  
+  setupWifi();
+}
+
+// Настройка WiFi (точка доступа или клиент)
+void setupWifi() {
+  // Читаем сохраненные настройки
+  preferences.begin("wifi", true);
+  ssid = preferences.getString("ssid", "");
+  password = preferences.getString("password", "");
+  ap_mode = preferences.getBool("ap_mode", true); // Читаем сохраненный режим
+  preferences.end();
+  
+  // Читаем настройки MQTT
+  preferences.begin("mqtt", true);
+  mqtt_enabled = preferences.getBool("enabled", false);
+  mqtt_server = preferences.getString("server", "");
+  mqtt_port = preferences.getString("port", "1883");
+  mqtt_user = preferences.getString("user", "");
+  mqtt_password = preferences.getString("password", "");
+  mqtt_prefix = preferences.getString("prefix", "homeassistant");
+  preferences.end();
+  
+  // Получаем MAC адрес и формируем имя устройства, если еще не сформировано
+  if (deviceName == "") {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char macStr[7];
+    sprintf(macStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
+    deviceName = String(DEVICE_PREFIX) + String(macStr);
+    mqtt_client_id = deviceName; // Устанавливаем ID клиента MQTT
+  }
+  
+  // Устанавливаем имя хоста
+  WiFi.setHostname(deviceName.c_str());
+  
+  // Режим работы в зависимости от наличия настроек
+  if (ssid.length() > 0) {
+    // Клиентский режим
+    Serial.println("Connecting to WiFi: " + ssid);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    
+    // Пытаемся подключиться с ограничением по времени
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("");
+      Serial.println("WiFi connected");
+      Serial.println("IP address: " + WiFi.localIP().toString());
+      ap_mode = false;
+    } else {
+      Serial.println("");
+      Serial.println("Failed to connect to WiFi");
+      startAPMode(); // Если не удалось подключиться, запускаем точку доступа
+    }
+  } else {
+    // Режим точки доступа
+    startAPMode();
+  }
+}
+
+// Запуск режима точки доступа
+void startAPMode() {
+  Serial.println("Starting Access Point Mode");
+  WiFi.mode(WIFI_AP);
+  
+  // Получаем MAC адрес и формируем имя устройства
+  if (deviceName == "") {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char macStr[7];
+    sprintf(macStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
+    deviceName = String(DEVICE_PREFIX) + String(macStr);
+    Serial.println("Device name: " + deviceName);
+  }
+  
+  // Запускаем открытую точку доступа (без пароля)
+  WiFi.softAP(deviceName.c_str());
+  
+  Serial.println("AP started");
+  Serial.println("AP IP address: " + WiFi.softAPIP().toString());
+  
+  // Запускаем DNS сервер для перенаправления на веб-интерфейс
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  ap_mode = true;
+  isConnected = false;  // Сбрасываем флаг подключения
 } 
