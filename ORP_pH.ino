@@ -1,24 +1,25 @@
 #include <WiFi.h>        // Библиотека для работы с WiFi
-#include <WebServer.h>    // Библиотека для создания веб-сервера
-#include <DNSServer.h>    // Библиотека для DNS-сервера (перенаправление на страницу настройки)
-#include <Preferences.h>  // Библиотека для хранения настроек в энергонезависимой памяти
-#include <Update.h>       // Библиотека для OTA обновления
-#include <HTTPUpdate.h>   // Библиотека для HTTP OTA обновления
+#include <WebServer.h>   // Веб-сервер
+#include <Preferences.h>  // Хранение настроек в NVS
+#include <DNSServer.h>    // DNS-сервер для режима точки доступа
+#include <ESPmDNS.h>     // Для OTA
+#include <WiFiUdp.h>     // Для OTA
+#include <ArduinoOTA.h>  // Для OTA
 
 // Константы и параметры
 #define BOOT_BUTTON 0   // GPIO0 для кнопки BOOT
 #define LED_PIN     2   // Светодиод индикации (GPIO2)
+#define DNS_PORT    53  // Порт DNS сервера
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
-const char* VERSION = "v1.0.1"; // Версия прошивки
-String deviceName = ""; // Полное имя устройства с MAC
-const byte DNS_PORT = 53;
+const char* VERSION = "v1.2.0"; // Версия прошивки
 
 // Объекты для работы
-WebServer server(80);   // Веб-сервер на порту 80
-DNSServer dnsServer;    // DNS-сервер для перенаправления на страницу настройки
-Preferences preferences; // Объект для работы с энергонезависимой памятью
+WebServer server(80);
+DNSServer dnsServer;
+Preferences preferences;
 
 // Переменные для хранения настроек
+String deviceName = "";  // Имя устройства
 String ssid = "";         // Имя WiFi сети
 String password = "";     // Пароль WiFi сети
 String mqtt_server = "";  // Адрес MQTT сервера
@@ -36,169 +37,41 @@ bool ap_mode = true;
 bool ledState = false;          // Текущее состояние светодиода
 bool isConnected = false;       // Флаг подключения к сети или клиента к AP
 bool isResetting = false;       // Флаг процесса сброса
-bool isUpdating = false;        // Флаг процесса OTA обновления
 unsigned long ledLastToggle = 0; // Время последнего переключения светодиода
+
+// Добавляем переменные для watchdog
+static unsigned long lastReset = 0;
+const unsigned long WATCHDOG_TIMEOUT = 30000; // 30 секунд
 
 // Обработка страницы конфигурации
 void handleRoot() {
   server.send(200, "text/html", getAPConfigPage());
 }
 
-// Обработчик для OTA обновления
-void handleOTAUpdate() {
-  Serial.println("=== OTA Update Handler ===");
-  Serial.println("Current version: v1.0.1");
-  Serial.println("Starting OTA update process...");
+// Улучшенная функция сохранения настроек
+void saveSettings() {
+  Serial.println("Saving settings to NVS...");
   
-  HTTPUpload& upload = server.upload();
-  static bool updateStarted = false;
-  static size_t totalSize = 0;
+  // Сохраняем WiFi настройки
+  preferences.begin("wifi", false);
+  preferences.clear();
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+  preferences.putBool("ap_mode", ap_mode);
+  preferences.end();
   
-  Serial.println("OTA Update handler called");
-  Serial.printf("Upload status: %d\n", upload.status);
-  Serial.printf("Upload filename: %s\n", upload.filename.c_str());
-  Serial.printf("Upload name: %s\n", upload.name.c_str());
-  Serial.printf("Upload type: %s\n", upload.type.c_str());
-  Serial.printf("Upload totalSize: %u\n", upload.totalSize);
-  Serial.printf("Upload currentSize: %u\n", upload.currentSize);
+  // Сохраняем MQTT настройки
+  preferences.begin("mqtt", false);
+  preferences.clear();
+  preferences.putBool("enabled", mqtt_enabled);
+  preferences.putString("server", mqtt_server);
+  preferences.putString("port", mqtt_port);
+  preferences.putString("user", mqtt_user);
+  preferences.putString("password", mqtt_password);
+  preferences.putString("topic", mqtt_topic);
+  preferences.end();
   
-  if (upload.status == UPLOAD_FILE_START) {
-    if (isUpdating) {
-      Serial.println("Update already in progress");
-      server.send(500, "text/plain", "Update already in progress");
-      return;
-    }
-    
-    // Выводим текущие настройки
-    Serial.println("Current settings before update:");
-    Serial.println("WiFi SSID: " + ssid);
-    Serial.println("WiFi Password: " + password);
-    Serial.println("MQTT Server: " + mqtt_server);
-    Serial.println("MQTT Port: " + mqtt_port);
-    Serial.println("MQTT User: " + mqtt_user);
-    Serial.println("MQTT Topic: " + mqtt_topic);
-    Serial.println("MQTT Enabled: " + String(mqtt_enabled ? "true" : "false"));
-    
-    Serial.printf("Update: %s\n", upload.filename.c_str());
-    Serial.printf("Starting update...\n");
-    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-    Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
-    
-    // Проверяем, что это бинарный файл
-    if (upload.filename.indexOf(".bin") == -1) {
-      Serial.println("Error: Not a binary file");
-      server.send(500, "text/plain", "Error: Not a binary file");
-      return;
-    }
-    
-    isUpdating = true;
-    updateStarted = false;
-    totalSize = 0;
-    Serial.println("Waiting for file upload...");
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (!isUpdating) {
-      Serial.println("Update not started");
-      server.send(500, "text/plain", "Update not started");
-      return;
-    }
-    
-    // Накапливаем общий размер
-    totalSize += upload.currentSize;
-    Serial.printf("Received chunk: %u bytes, total: %u bytes\n", upload.currentSize, totalSize);
-    
-    // Если обновление еще не начато и мы получили достаточно данных
-    if (!updateStarted && totalSize > 1024) {
-      Serial.printf("Starting update, received size: %u bytes\n", totalSize);
-      Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-      Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
-      
-      // Проверяем, что файл не слишком большой
-      if (totalSize > (ESP.getFreeSketchSpace() - 0x1000)) {
-        Serial.printf("Error: File too large (%u > %u)\n", totalSize, ESP.getFreeSketchSpace() - 0x1000);
-        server.send(500, "text/plain", "Error: File too large");
-        isUpdating = false;
-        return;
-      }
-      
-      // Начинаем обновление с сохранением настроек
-      if (!Update.begin(totalSize, U_FLASH)) {
-        Serial.printf("Update begin failed: ");
-        Update.printError(Serial);
-        server.send(500, "text/plain", "Update begin failed");
-        isUpdating = false;
-        return;
-      }
-      updateStarted = true;
-      Serial.printf("Update begin successful, size: %u bytes\n", totalSize);
-    }
-    
-    // Если обновление начато, записываем данные
-    if (updateStarted) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Serial.printf("Update write failed: ");
-        Update.printError(Serial);
-        server.send(500, "text/plain", "Update write failed");
-        isUpdating = false;
-        updateStarted = false;
-        return;
-      }
-      
-      // Выводим прогресс
-      static uint8_t lastProgress = 0;
-      uint8_t currentProgress = (totalSize * 100) / upload.totalSize;
-      if (currentProgress != lastProgress) {
-        lastProgress = currentProgress;
-        Serial.printf("Progress: %u%% (%u/%u bytes)\n", currentProgress, totalSize, upload.totalSize);
-      }
-    }
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (!isUpdating || !updateStarted) {
-      Serial.println("Update not started");
-      server.send(500, "text/plain", "Update not started");
-      return;
-    }
-    
-    Serial.printf("Update file end, total size: %u bytes\n", totalSize);
-    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-    
-    // Завершаем обновление
-    if (!Update.end(true)) {
-      Serial.printf("Update failed: ");
-      Update.printError(Serial);
-      server.send(500, "text/plain", "Update failed");
-      isUpdating = false;
-      updateStarted = false;
-      return;
-    }
-    
-    Serial.printf("Update Success: %u bytes\n", totalSize);
-    Serial.println("Rebooting...");
-    
-    // Отправляем страницу успешного обновления
-    String successPage = "<!DOCTYPE html><html><head>";
-    successPage += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-    successPage += "<title>Update Success</title>";
-    successPage += "<style>";
-    successPage += "body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;padding:0;background-color:#121212;color:#e0e0e0;}";
-    successPage += ".container{max-width:800px;margin:20px auto;padding:20px;background-color:#1e1e1e;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.3);}";
-    successPage += "h1{color:#4CAF50;margin-bottom:20px;font-size:24px;font-weight:500;}";
-    successPage += "p{color:#b0b0b0;font-size:14px;line-height:1.5;}";
-    successPage += "</style>";
-    successPage += "<meta http-equiv='refresh' content='5;url=/'></head><body>";
-    successPage += "<div class='container'>";
-    successPage += "<h1>Update Success!</h1>";
-    successPage += "<p>Firmware has been successfully updated.</p>";
-    successPage += "<p>Device will reboot in 5 seconds...</p>";
-    successPage += "</div></body></html>";
-    
-    server.send(200, "text/html", successPage);
-    
-    // Даем время на отправку ответа
-    delay(1000);
-    
-    // Перезагружаем устройство
-    ESP.restart();
-  }
+  Serial.println("Settings saved successfully");
 }
 
 // Страница конфигурации точки доступа и WiFi
@@ -206,6 +79,9 @@ String getAPConfigPage() {
   // Формируем HTML-страницу с настройками
   String html = "<!DOCTYPE html><html><head>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>";
+  html += "<meta http-equiv='Pragma' content='no-cache'>";
+  html += "<meta http-equiv='Expires' content='0'>";
   html += "<title>Eyera " + deviceName + " sensor</title>";
   html += "<style>";
   html += "body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;padding:0;background-color:#121212;color:#e0e0e0;}";
@@ -227,12 +103,33 @@ String getAPConfigPage() {
   html += ".header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}";
   html += ".header h1{margin:0;}";
   html += ".header .version{color:#888;font-size:14px;}";
+  html += ".ota-link{display:inline-block;margin-top:15px;color:#90caf9;text-decoration:none;font-size:14px;}";
+  html += ".ota-link:hover{text-decoration:underline;}";
+  html += ".file-input{width:100%;padding:10px;margin:5px 0;border:1px solid #333;border-radius:4px;box-sizing:border-box;font-size:14px;background-color:#2d2d2d;color:#e0e0e0;}";
+  html += ".progress-bar{width:100%;height:20px;background-color:#2d2d2d;border-radius:4px;margin-top:10px;overflow:hidden;display:none;}";
+  html += ".progress-bar-fill{height:100%;background-color:#90caf9;width:0%;transition:width 0.3s;}";
   html += "</style>";
   html += "</head><body>";
   html += "<div class='container'>";
   html += "<div class='header'>";
   html += "<h1>Eyera " + deviceName + " sensor</h1>";
   html += "<span class='version'>" + String(VERSION) + "</span>";
+  html += "</div>";
+  
+  // Секция статуса
+  html += "<div class='section'>";
+  html += "<h2>Device Status</h2>";
+  html += "<div class='status'>";
+  html += "<div class='status-item'><span class='status-label'>Mode:</span><span class='status-value'>" + String(ap_mode ? "Access Point" : "WiFi Client") + "</span></div>";
+  html += "<div class='status-item'><span class='status-label'>Connection:</span><span class='status-value " + String(isConnected ? "connected" : "disconnected") + "'>" + String(isConnected ? "Connected" : "Disconnected") + "</span></div>";
+  if (!ap_mode) {
+    html += "<div class='status-item'><span class='status-label'>IP Address:</span><span class='status-value'>" + WiFi.localIP().toString() + "</span></div>";
+    html += "<div class='status-item'><span class='status-label'>Signal Strength:</span><span class='status-value'>" + String(WiFi.RSSI()) + " dBm</span></div>";
+  } else {
+    html += "<div class='status-item'><span class='status-label'>AP IP Address:</span><span class='status-value'>" + WiFi.softAPIP().toString() + "</span></div>";
+    html += "<div class='status-item'><span class='status-label'>Connected Clients:</span><span class='status-value'>" + String(WiFi.softAPgetStationNum()) + "</span></div>";
+  }
+  html += "</div>";
   html += "</div>";
   
   // Секция настроек WiFi
@@ -277,16 +174,40 @@ String getAPConfigPage() {
     html += "<p class='info-text'>This will erase all WiFi settings and restart the device in Access Point mode.</p>";
     html += "</form>";
     html += "</div>";
-
-    // Добавляем секцию OTA обновления только в режиме клиента
+  }
+  
+  // Секция OTA обновления (только в режиме клиента)
+  if (!ap_mode) {
     html += "<div class='section'>";
-    html += "<h2>OTA Update</h2>";
+    html += "<h2>Firmware Update</h2>";
     html += "<form action='/update' method='POST' enctype='multipart/form-data'>";
     html += "<label for='update'>Select firmware file:</label>";
-    html += "<input type='file' name='update' id='update' accept='.bin' required>";
-    html += "<input type='submit' value='Upload and Update'>";
-    html += "<p class='info-text'>Upload a new firmware file to update the device.</p>";
+    html += "<input type='file' name='update' class='file-input' accept='.bin'>";
+    html += "<div class='progress-bar' id='progress-bar'>";
+    html += "<div class='progress-bar-fill' id='progress-bar-fill'></div>";
+    html += "</div>";
+    html += "<input type='submit' value='Update Firmware'>";
     html += "</form>";
+    html += "<script>";
+    html += "document.querySelector('form').addEventListener('submit', function(e) {";
+    html += "  var fileInput = document.querySelector('input[type=file]');";
+    html += "  if (fileInput.files.length === 0) {";
+    html += "    e.preventDefault();";
+    html += "    alert('Please select a firmware file');";
+    html += "    return;";
+    html += "  }";
+    html += "  var progressBar = document.getElementById('progress-bar');";
+    html += "  var progressFill = document.getElementById('progress-bar-fill');";
+    html += "  progressBar.style.display = 'block';";
+    html += "  var xhr = new XMLHttpRequest();";
+    html += "  xhr.upload.addEventListener('progress', function(e) {";
+    html += "    if (e.lengthComputable) {";
+    html += "      var percent = Math.round((e.loaded / e.total) * 100);";
+    html += "      progressFill.style.width = percent + '%';";
+    html += "    }";
+    html += "  });";
+    html += "});";
+    html += "</script>";
     html += "</div>";
   }
   
@@ -496,21 +417,128 @@ void startAPMode() {
 
 // Настройка веб-сервера
 void setupServer() {
+  Serial.println("\nSetting up web server...");
+  
   // Регистрируем обработчики для разных URL
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/save-wifi", HTTP_POST, handleSaveWifi);
-  server.on("/save-mqtt", HTTP_POST, handleSaveMQTT);
-  server.on("/reset-wifi", HTTP_POST, handleResetWifi);
-  server.on("/update", HTTP_POST, []() {
-    server.send(200, "text/plain", "Update Success!");
-  }, handleOTAUpdate);
   
-  // Обработчик для всех остальных URL, чтобы избежать ошибок 404
-  server.onNotFound([]() {
-    server.send(200, "text/html", getAPConfigPage());
+  // Обработчик OTA обновления
+  server.on("/update", HTTP_POST, []() {
+    server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>Update complete!</h1><p>Device will restart in 5 seconds...</p></body></html>");
+    delay(1000);
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("Update: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+  
+  server.on("/save-wifi", HTTP_POST, [](){
+    if (server.hasArg("ssid") && server.hasArg("password")) {
+      ssid = server.arg("ssid");
+      password = server.arg("password");
+      
+      // Сохраняем настройки
+      preferences.begin("wifi", false);
+      preferences.clear();
+      preferences.putString("ssid", ssid);
+      preferences.putString("password", password);
+      preferences.putBool("ap_mode", false);
+      preferences.end();
+      
+      // Отправляем ответ
+      server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings saved!</h1><p>The device will try to connect to the WiFi network.</p><p>If connection fails, the Access Point will be restarted.</p><p>Redirecting in 5 seconds...</p></body></html>");
+      
+      // Перезапускаем WiFi
+      ap_mode = false;
+      WiFi.disconnect();
+      delay(1000);
+      setupWifi();
+    } else {
+      server.send(400, "text/plain", "Missing parameters");
+    }
+  });
+  
+  server.on("/save-mqtt", HTTP_POST, [](){
+    if (server.hasArg("mqtt_server") && server.hasArg("mqtt_port")) {
+      mqtt_enabled = server.hasArg("mqtt_enabled");
+      mqtt_server = server.arg("mqtt_server");
+      mqtt_port = server.arg("mqtt_port");
+      mqtt_user = server.arg("mqtt_user");
+      mqtt_password = server.arg("mqtt_password");
+      mqtt_topic = server.arg("mqtt_topic");
+      
+      // Сохраняем настройки
+      preferences.begin("mqtt", false);
+      preferences.clear();
+      preferences.putBool("enabled", mqtt_enabled);
+      preferences.putString("server", mqtt_server);
+      preferences.putString("port", mqtt_port);
+      preferences.putString("user", mqtt_user);
+      preferences.putString("password", mqtt_password);
+      preferences.putString("topic", mqtt_topic);
+      preferences.end();
+      
+      server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
+    } else {
+      server.send(400, "text/plain", "Missing parameters");
+    }
+  });
+  
+  server.on("/reset-wifi", HTTP_POST, [](){
+    server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings have been reset!</h1><p>The device will restart as an Access Point.</p><p>Redirecting in 5 seconds...</p></body></html>");
+    delay(1000);
+    resetWiFiSettings();
   });
   
   server.begin();
+  Serial.println("Web server started");
+}
+
+// Настройка OTA
+void setupOTA() {
+  Serial.println("Setting up OTA...");
+  
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else
+        type = "filesystem";
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+  Serial.println("OTA ready");
 }
 
 // Проверка нажатия кнопки BOOT
@@ -584,26 +612,18 @@ void updateLedState() {
   }
 }
 
-void setup() {
-  // Инициализация последовательного порта для отладки
-  Serial.begin(115200);
-  Serial.println("Starting ESP32 ORP/pH Device");
-  Serial.println("Version: " + String(VERSION));
+// Функция загрузки настроек
+void loadSettings() {
+  Serial.println("Loading settings from NVS...");
   
-  // Даем время на инициализацию NVS
-  delay(100);
-  
-  // Читаем и выводим настройки WiFi
+  // Загружаем WiFi настройки
   preferences.begin("wifi", true);
   ssid = preferences.getString("ssid", "");
   password = preferences.getString("password", "");
+  ap_mode = preferences.getBool("ap_mode", true);
   preferences.end();
   
-  Serial.println("Current WiFi settings:");
-  Serial.println("SSID: " + ssid);
-  Serial.println(String("Password: ") + (password.length() > 0 ? "********" : "not set"));
-  
-  // Читаем и выводим настройки MQTT
+  // Загружаем MQTT настройки
   preferences.begin("mqtt", true);
   mqtt_enabled = preferences.getBool("enabled", false);
   mqtt_server = preferences.getString("server", "");
@@ -613,61 +633,73 @@ void setup() {
   mqtt_topic = preferences.getString("topic", "sensors/orp_ph");
   preferences.end();
   
-  Serial.println("Current MQTT settings:");
-  Serial.println("Enabled: " + String(mqtt_enabled ? "true" : "false"));
-  Serial.println("Server: " + mqtt_server);
-  Serial.println("Port: " + mqtt_port);
-  Serial.println("User: " + mqtt_user);
-  Serial.println("Topic: " + mqtt_topic);
+  Serial.println("Settings loaded successfully");
+}
+
+// Улучшенная функция setup
+void setup() {
+  // Инициализация последовательного порта
+  Serial.begin(115200);
+  Serial.println("\n=== ESP32 ORP/pH Device ===");
+  Serial.println("Version: " + String(VERSION));
   
-  // Выводим информацию о памяти
-  Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-  Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
-  Serial.printf("Sketch size: %u bytes\n", ESP.getSketchSize());
-  Serial.printf("Flash size: %u bytes\n", ESP.getFlashChipSize());
+  // Даем время на инициализацию
+  delay(100);
   
-  // Настройка кнопки BOOT и светодиода
+  // Инициализация GPIO
   pinMode(BOOT_BUTTON, INPUT);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   
+  // Загрузка настроек
+  loadSettings();
+  
   // Настройка WiFi
   setupWifi();
+  
+  // Настройка OTA (только в режиме клиента)
+  if (!ap_mode) {
+    setupOTA();
+  }
   
   // Настройка веб-сервера
   setupServer();
   
-  // Инициализация OTA
-  Update.onProgress([](size_t progress, size_t total) {
-    static uint8_t lastProgress = 0;
-    uint8_t currentProgress = (progress * 100) / total;
-    if (currentProgress != lastProgress) {
-      lastProgress = currentProgress;
-      Serial.printf("OTA Progress: %u%%\n", currentProgress);
-    }
-  });
-  
   Serial.println("Setup completed");
 }
 
+// Модифицируем функцию loop
 void loop() {
-  // Обработка DNS запросов в режиме точки доступа
+  static unsigned long lastCheck = 0;
+  const unsigned long CHECK_INTERVAL = 100; // 100ms
+  
+  unsigned long now = millis();
+  
+  // Периодические проверки
+  if (now - lastCheck >= CHECK_INTERVAL) {
+    lastCheck = now;
+    
+    // Проверка подключений
+    checkConnections();
+    
+    // Обновление LED
+    updateLedState();
+    
+    // Проверка кнопки сброса
+    checkResetButton();
+  }
+  
+  // Обработка DNS и HTTP запросов
   if (ap_mode) {
     dnsServer.processNextRequest();
   }
-  
-  // Обработка HTTP запросов
   server.handleClient();
   
-  // Проверка нажатия кнопки BOOT для сброса WiFi
-  checkResetButton();
+  // Обработка OTA (только в режиме клиента)
+  if (!ap_mode) {
+    ArduinoOTA.handle();
+  }
   
-  // Проверка подключений
-  checkConnections();
-  
-  // Обновление состояния светодиода
-  updateLedState();
-  
-  // Задержка для стабильной работы
-  delay(10);
+  // Даем время другим задачам
+  yield();
 } 
