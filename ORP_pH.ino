@@ -13,7 +13,7 @@
 #define DNS_PORT    53  // Порт DNS сервера
 #define DEBUG_MODE false // Режим отладки
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
-const char* VERSION = "v1.2.1a"; // Версия прошивки
+const char* VERSION = "v1.2.1b"; // Версия прошивки
 
 // Объекты для работы
 WebServer server(80);
@@ -50,9 +50,6 @@ const unsigned long WATCHDOG_TIMEOUT = 30000; // 30 секунд
 // Переменные для хранения значений сенсоров
 float orpValue = 0.0;  // Значение ORP в mV
 float phValue = 0.0;   // Значение pH
-
-// Объявление функции debugPrint
-void debugPrint(const String& message);
 
 // В начале файла, после объявления mqttClient
 #define MQTT_MAX_PACKET_SIZE 512  // Увеличиваем размер буфера MQTT
@@ -93,9 +90,7 @@ void safePrint(const String& message) {
 // Функция для формирования MQTT топиков
 String getMqttTopic(const String& type, const String& name = "") {
   String topic = mqtt_prefix;
-  if (type == "status") {
-    topic += "/status";
-  } else if (type == "sensor") {
+  if (type == "sensor") {
     topic += "/sensor/orp_ph";
     if (name != "") {
       topic += "/" + name;
@@ -872,7 +867,7 @@ void setup() {
 // Функция для проверки подключения к WiFi
 bool checkWiFiConnection() {
   if (WiFi.status() != WL_CONNECTED) {
-    debugPrint("WiFi connection lost");
+    safePrintln("WiFi connection lost");
     return false;
   }
   return true;
@@ -918,8 +913,8 @@ void sendMqttData() {
                      "\"unit_of_meas\":\"mV\","
                      "\"dev\":{\"ids\":[\"" + String(macStr) + "\"],"
                              "\"name\":\"" + deviceName + "\","
-                             "\"mf\":\"eyera\","
-                             "\"mdl\":\"orp_ph\"},"
+                             "\"mf\":\"Eyera\","
+                             "\"mdl\":\"ORP-pH\"},"
                      "\"stat_t\":\"" + stateTopic + "\","
                      "\"val_tpl\":\"{{ value_json.orp }}\","
                      "\"frc_upd\":true,"
@@ -933,8 +928,8 @@ void sendMqttData() {
                     "\"unit_of_meas\":\"pH\","
                     "\"dev\":{\"ids\":[\"" + String(macStr) + "\"],"
                             "\"name\":\"" + deviceName + "\","
-                            "\"mf\":\"eyera\","
-                            "\"mdl\":\"orp_ph\"},"
+                            "\"mf\":\"Eyera\","
+                            "\"mdl\":\"ORP-pH\"},"
                     "\"stat_t\":\"" + stateTopic + "\","
                     "\"val_tpl\":\"{{ value_json.ph }}\","
                     "\"frc_upd\":true,"
