@@ -5,11 +5,13 @@
 #include <ESPmDNS.h>     // Для OTA
 #include <WiFiUdp.h>     // Для OTA
 #include <ArduinoOTA.h>  // Для OTA
+#include <PubSubClient.h> // Для MQTT
 
 // Константы и параметры
 #define BOOT_BUTTON 0   // GPIO0 для кнопки BOOT
 #define LED_PIN     2   // Светодиод индикации (GPIO2)
 #define DNS_PORT    53  // Порт DNS сервера
+#define DEBUG_MODE false // Режим отладки
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
 const char* VERSION = "v1.2.0"; // Версия прошивки
 
@@ -17,6 +19,8 @@ const char* VERSION = "v1.2.0"; // Версия прошивки
 WebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 // Переменные для хранения настроек
 String deviceName = "";  // Имя устройства
@@ -26,7 +30,7 @@ String mqtt_server = "";  // Адрес MQTT сервера
 String mqtt_port = "1883"; // Порт MQTT сервера
 String mqtt_user = "";    // Имя пользователя MQTT
 String mqtt_password = ""; // Пароль MQTT
-String mqtt_topic = "sensors/orp_ph"; // Топик MQTT
+String mqtt_topic = "homeassistant/sensor/orp_ph"; // Топик MQTT для Home Assistant
 bool mqtt_enabled = false; // Включен ли MQTT
 String mqtt_client_id = ""; // ID клиента MQTT (будет установлен как имя устройства)
 
@@ -42,6 +46,64 @@ unsigned long ledLastToggle = 0; // Время последнего перекл
 // Добавляем переменные для watchdog
 static unsigned long lastReset = 0;
 const unsigned long WATCHDOG_TIMEOUT = 30000; // 30 секунд
+
+// Объявление функции debugPrint
+void debugPrint(const String& message);
+
+// Функция для подключения к MQTT
+bool connectToMQTT() {
+  if (!mqtt_enabled) {
+    return false;
+  }
+  
+  // Устанавливаем LWT
+  String lwtTopic = mqtt_topic;
+  if (!lwtTopic.endsWith("/")) {
+    lwtTopic += "/";
+  }
+  lwtTopic += "availability";
+  
+  if (mqttClient.connect(mqtt_client_id.c_str(), mqtt_user.c_str(), mqtt_password.c_str(), lwtTopic.c_str(), 0, true, "offline")) {
+    // После успешного подключения отправляем конфигурацию
+    sendMqttData();
+    return true;
+  }
+  
+  return false;
+}
+
+// Функция для проверки состояния MQTT
+String getMqttStatus() {
+  static String lastStatus = "";
+  String currentStatus;
+  
+  if (!mqtt_enabled) {
+    currentStatus = "disabled";
+  } else if (mqttClient.connected()) {
+    currentStatus = "connected";
+  } else {
+    // Если не подключен, пробуем подключиться
+    connectToMQTT();
+    
+    int state = mqttClient.state();
+    if (state != MQTT_CONNECTION_TIMEOUT && 
+        state != MQTT_CONNECTION_LOST && 
+        state != MQTT_CONNECT_FAILED) {
+      currentStatus = "connecting";
+    } else {
+      currentStatus = "error";
+    }
+  }
+  
+  // Выводим сообщение только если статус изменился
+  if (currentStatus != lastStatus) {
+    Serial.print("MQTT Status: ");
+    Serial.println(currentStatus);
+    lastStatus = currentStatus;
+  }
+  
+  return currentStatus;
+}
 
 // Обработка страницы конфигурации
 void handleRoot() {
@@ -108,6 +170,13 @@ String getAPConfigPage() {
   html += ".file-input{width:100%;padding:10px;margin:5px 0;border:1px solid #333;border-radius:4px;box-sizing:border-box;font-size:14px;background-color:#2d2d2d;color:#e0e0e0;}";
   html += ".progress-bar{width:100%;height:20px;background-color:#2d2d2d;border-radius:4px;margin-top:10px;overflow:hidden;display:none;}";
   html += ".progress-bar-fill{height:100%;background-color:#90caf9;width:0%;transition:width 0.3s;}";
+  html += ".mqtt-status { margin: 10px 0; display: flex; align-items: center; }";
+  html += ".status-indicator { width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }";
+  html += ".status-indicator.disabled { background-color: #000000; }";
+  html += ".status-indicator.connecting { background-color: #ffa500; }";
+  html += ".status-indicator.connected { background-color: #4CAF50; }";
+  html += ".status-indicator.error { background-color: #f44336; }";
+  html += ".status-text { color: #b0b0b0; font-size: 14px; }";
   html += "</style>";
   html += "</head><body>";
   html += "<div class='container'>";
@@ -150,6 +219,10 @@ String getAPConfigPage() {
     html += "<h2>MQTT Settings</h2>";
     html += "<form action='/save-mqtt' method='POST'>";
     html += "<label class='checkbox-label'><input type='checkbox' name='mqtt_enabled' " + String(mqtt_enabled ? "checked" : "") + "> Enable MQTT</label>";
+    html += "<div class='mqtt-status' id='mqttStatus'>";
+    html += "<span class='status-indicator " + getMqttStatus() + "'></span>";
+    html += "<span class='status-text'>" + getMqttStatus() + "</span>";
+    html += "</div>";
     html += "<label for='mqtt_server'>MQTT Server:</label>";
     html += "<input type='text' name='mqtt_server' value='" + mqtt_server + "'>";
     html += "<label for='mqtt_port'>MQTT Port:</label>";
@@ -163,6 +236,31 @@ String getAPConfigPage() {
     html += "<input type='submit' value='Save MQTT Settings'>";
     html += "</form>";
     html += "</div>";
+    
+    // Добавляем стили для индикатора
+    html += "<style>";
+    html += ".mqtt-status { margin: 10px 0; display: flex; align-items: center; }";
+    html += ".status-indicator { width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }";
+    html += ".status-indicator.disabled { background-color: #000000; }";
+    html += ".status-indicator.connecting { background-color: #ffa500; }";
+    html += ".status-indicator.connected { background-color: #4CAF50; }";
+    html += ".status-indicator.error { background-color: #f44336; }";
+    html += ".status-text { color: #b0b0b0; font-size: 14px; }";
+    html += "</style>";
+    
+    // Добавляем JavaScript для обновления статуса
+    html += "<script>";
+    html += "function updateMqttStatus() {";
+    html += "  fetch('/mqtt-status').then(response => response.json())";
+    html += "    .then(data => {";
+    html += "      const indicator = document.querySelector('.status-indicator');";
+    html += "      const text = document.querySelector('.status-text');";
+    html += "      indicator.className = 'status-indicator ' + data.status;";
+    html += "      text.textContent = data.status;";
+    html += "    });";
+    html += "}";
+    html += "setInterval(updateMqttStatus, 5000);"; // Обновляем каждые 5 секунд
+    html += "</script>";
   }
   
   // Добавляем кнопку сброса настроек только в режиме клиента
@@ -281,7 +379,7 @@ void handleSaveMQTT() {
   preferences.putString("port", mqtt_port);
   preferences.putString("user", mqtt_user);
   preferences.putString("password", mqtt_password);
-  preferences.putString("topic", mqtt_topic);
+  preferences.putString("topic", mqtt_topic.isEmpty() ? "homeassistant/sensor/orp_ph" : mqtt_topic);
   preferences.end();
   
   Serial.println("MQTT settings saved to NVS");
@@ -341,7 +439,7 @@ void setupWifi() {
   mqtt_port = preferences.getString("port", "1883");
   mqtt_user = preferences.getString("user", "");
   mqtt_password = preferences.getString("password", "");
-  mqtt_topic = preferences.getString("topic", "sensors/orp_ph");
+  mqtt_topic = preferences.getString("topic", "homeassistant/sensor/orp_ph");
   preferences.end();
   
   // Получаем MAC адрес и формируем имя устройства, если еще не сформировано
@@ -490,7 +588,7 @@ void setupServer() {
       preferences.putString("port", mqtt_port);
       preferences.putString("user", mqtt_user);
       preferences.putString("password", mqtt_password);
-      preferences.putString("topic", mqtt_topic);
+      preferences.putString("topic", mqtt_topic.isEmpty() ? "homeassistant/sensor/orp_ph" : mqtt_topic);
       preferences.end();
       
       server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
@@ -504,6 +602,8 @@ void setupServer() {
     delay(1000);
     resetWiFiSettings();
   });
+  
+  server.on("/mqtt-status", HTTP_GET, handleMqttStatus);
   
   server.begin();
   Serial.println("Web server started");
@@ -630,7 +730,7 @@ void loadSettings() {
   mqtt_port = preferences.getString("port", "1883");
   mqtt_user = preferences.getString("user", "");
   mqtt_password = preferences.getString("password", "");
-  mqtt_topic = preferences.getString("topic", "sensors/orp_ph");
+  mqtt_topic = preferences.getString("topic", "homeassistant/sensor/orp_ph");
   preferences.end();
   
   Serial.println("Settings loaded successfully");
@@ -640,11 +740,19 @@ void loadSettings() {
 void setup() {
   // Инициализация последовательного порта
   Serial.begin(115200);
+  Serial.setTimeout(100); // Устанавливаем таймаут чтения
+  Serial.flush(); // Очищаем буфер
+  
+  // Ждем инициализации порта
+  while (!Serial) {
+    delay(10);
+  }
+  
+  // Даем время на стабилизацию
+  delay(1000);
+  
   Serial.println("\n=== ESP32 ORP/pH Device ===");
   Serial.println("Version: " + String(VERSION));
-  
-  // Даем время на инициализацию
-  delay(100);
   
   // Инициализация GPIO
   pinMode(BOOT_BUTTON, INPUT);
@@ -665,13 +773,99 @@ void setup() {
   // Настройка веб-сервера
   setupServer();
   
+  // Устанавливаем ID клиента MQTT как имя устройства
+  mqtt_client_id = deviceName;
+  
+  // Настройка MQTT клиента
+  mqttClient.setServer(mqtt_server.c_str(), atoi(mqtt_port.c_str()));
+  
+  // Пробуем подключиться к MQTT
+  if (mqtt_enabled) {
+    connectToMQTT();
+  }
+  
   Serial.println("Setup completed");
+}
+
+// Функция для проверки подключения к WiFi
+bool checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    debugPrint("WiFi connection lost");
+    return false;
+  }
+  return true;
+}
+
+// Добавляем обработчик для получения статуса MQTT
+void handleMqttStatus() {
+  String status = getMqttStatus();
+  String json = "{\"status\":\"" + status + "\"}";
+  server.send(200, "application/json", json);
+}
+
+// Функция для отправки данных в MQTT
+void sendMqttData() {
+  if (!mqtt_enabled || !mqttClient.connected()) {
+    return;
+  }
+  
+  // Формируем базовый топик
+  String baseTopic = mqtt_topic;
+  if (!baseTopic.endsWith("/")) {
+    baseTopic += "/";
+  }
+  
+  // Топики для устройства
+  String configTopic = baseTopic + "config";
+  String availabilityTopic = baseTopic + "availability";
+  
+  // Отправляем статус доступности
+  mqttClient.publish(availabilityTopic.c_str(), "online", true);
+  
+  // Формируем JSON для конфигурации устройства
+  String configJson = "{";
+  configJson += "\"name\":\"" + deviceName + "\",";
+  configJson += "\"availability_topic\":\"" + availabilityTopic + "\",";
+  configJson += "\"device\":{";
+  configJson += "\"identifiers\":[\"" + mqtt_client_id + "\"],";
+  configJson += "\"name\":\"" + deviceName + "\",";
+  configJson += "\"manufacturer\":\"Eyera\",";
+  configJson += "\"model\":\"ORP/pH Sensor\",";
+  configJson += "\"sw_version\":\"" + String(VERSION) + "\"";
+  configJson += "},";
+  
+  // Добавляем ORP сенсор
+  configJson += "\"orp\":{";
+  configJson += "\"name\":\"ORP\",";
+  configJson += "\"device_class\":\"voltage\",";
+  configJson += "\"state_topic\":\"" + baseTopic + "state\",";
+  configJson += "\"value_template\":\"{{ value_json.orp }}\",";
+  configJson += "\"unit_of_measurement\":\"mV\",";
+  configJson += "\"unique_id\":\"" + mqtt_client_id + "_orp\"";
+  configJson += "},";
+  
+  // Добавляем pH сенсор
+  configJson += "\"ph\":{";
+  configJson += "\"name\":\"pH\",";
+  configJson += "\"device_class\":\"ph\",";
+  configJson += "\"state_topic\":\"" + baseTopic + "state\",";
+  configJson += "\"value_template\":\"{{ value_json.ph }}\",";
+  configJson += "\"unit_of_measurement\":\"pH\",";
+  configJson += "\"unique_id\":\"" + mqtt_client_id + "_ph\"";
+  configJson += "}";
+  
+  configJson += "}";
+  
+  // Отправляем только конфигурацию
+  mqttClient.publish(configTopic.c_str(), configJson.c_str(), true);
 }
 
 // Модифицируем функцию loop
 void loop() {
   static unsigned long lastCheck = 0;
+  static unsigned long lastMqttSend = 0;
   const unsigned long CHECK_INTERVAL = 100; // 100ms
+  const unsigned long MQTT_SEND_INTERVAL = 60000; // 60 секунд
   
   unsigned long now = millis();
   
@@ -687,6 +881,17 @@ void loop() {
     
     // Проверка кнопки сброса
     checkResetButton();
+    
+    // Обработка MQTT
+    if (mqtt_enabled) {
+      mqttClient.loop();
+      
+      // Отправка данных в MQTT
+      if (now - lastMqttSend >= MQTT_SEND_INTERVAL) {
+        lastMqttSend = now;
+        sendMqttData();
+      }
+    }
   }
   
   // Обработка DNS и HTTP запросов
