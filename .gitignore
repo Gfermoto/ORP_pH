@@ -1,6 +1,9 @@
-build/
-*.bin
+# Arduino IDE
 *.elf
+*.bin
 *.map
+*.merged.bin
 *.partitions.bin
-*.merged.bin 
+build/
+.pio/
+.vscode/ 
