@@ -1,11 +1,10 @@
 #include <WiFi.h>        // Библиотека для работы с WiFi
-#include <AsyncTCP.h>    // Асинхронный TCP для ESP32
-#include <ESPAsyncWebServer.h> // Асинхронный веб-сервер
+#include <WebServer.h>   // Стандартный веб-сервер
 #include <Preferences.h>  // Хранение настроек в NVS
 #include <DNSServer.h>    // DNS-сервер для режима точки доступа
 #include <ESPmDNS.h>     // Для OTA
 #include <WiFiUdp.h>     // Для OTA
-#include <ArduinoOTA.h>  // Для OTA
+#include <ArduinoOTA.h>  // OTA обновление
 #include <PubSubClient.h> // Для MQTT
 
 // Константы и параметры
@@ -14,10 +13,21 @@
 #define DNS_PORT    53  // Порт DNS сервера
 #define DEBUG_MODE false // Режим отладки
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
-const char* VERSION = "v1.2.2"; // Версия прошивки
+const char* VERSION = "v1.2.1b"; // Версия прошивки
+
+// Интервалы обновления
+const unsigned long CHECK_INTERVAL = 100;      // 100ms - проверка состояния
+const unsigned long MQTT_SEND_INTERVAL = 60000; // 60s - отправка MQTT
+const unsigned long SENSOR_UPDATE_INTERVAL = 5000; // 5s - обновление сенсоров
+const unsigned long LED_BLINK_INTERVAL = 500;  // 500ms - мигание LED
+const unsigned long LED_FAST_BLINK = 100;      // 100ms - быстрое мигание при сбросе
+
+// Размеры буферов
+#define MQTT_MAX_PACKET_SIZE 512  // Размер буфера MQTT
+#define MAX_JSON_SIZE 256         // Максимальный размер JSON сообщения
 
 // Объекты для работы
-AsyncWebServer server(80);
+WebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
 WiFiClient wifiClient;
@@ -51,9 +61,6 @@ const unsigned long WATCHDOG_TIMEOUT = 30000; // 30 секунд
 // Переменные для хранения значений сенсоров
 float orpValue = 0.0;  // Значение ORP в mV
 float phValue = 0.0;   // Значение pH
-
-// В начале файла, после объявления mqttClient
-#define MQTT_MAX_PACKET_SIZE 512  // Увеличиваем размер буфера MQTT
 
 // Функция для безопасного вывода в Serial
 void safePrintln(const String& message) {
@@ -166,34 +173,8 @@ String getMqttStatus() {
 }
 
 // Обработка страницы конфигурации
-void handleRoot(AsyncWebServerRequest *request) {
-  request->send(200, "text/html", getAPConfigPage());
-}
-
-// Улучшенная функция сохранения настроек
-void saveSettings() {
-  Serial.println("Saving settings to NVS...");
-  
-  // Сохраняем WiFi настройки
-  preferences.begin("wifi", false);
-  preferences.clear();
-  preferences.putString("ssid", ssid);
-  preferences.putString("password", password);
-  preferences.putBool("ap_mode", ap_mode);
-  preferences.end();
-  
-  // Сохраняем MQTT настройки
-  preferences.begin("mqtt", false);
-  preferences.clear();
-  preferences.putBool("enabled", mqtt_enabled);
-  preferences.putString("server", mqtt_server);
-  preferences.putString("port", mqtt_port);
-  preferences.putString("user", mqtt_user);
-  preferences.putString("password", mqtt_password);
-  preferences.putString("prefix", mqtt_prefix);
-  preferences.end();
-  
-  Serial.println("Settings saved successfully");
+void handleRoot() {
+  server.send(200, "text/html", getAPConfigPage());
 }
 
 // Страница конфигурации точки доступа и WiFi
@@ -374,10 +355,10 @@ String getAPConfigPage() {
 }
 
 // Обработчик сохранения WiFi настроек
-void handleSaveWifi(AsyncWebServerRequest *request) {
-  if (request->hasParam("ssid", true) && request->hasParam("password", true)) {
-    ssid = request->getParam("ssid", true)->value();
-    password = request->getParam("password", true)->value();
+void handleSaveWifi() {
+  if (server.hasArg("ssid") && server.hasArg("password")) {
+    ssid = server.arg("ssid");
+    password = server.arg("password");
     
     // Сохраняем настройки
     preferences.begin("wifi", false);
@@ -388,7 +369,7 @@ void handleSaveWifi(AsyncWebServerRequest *request) {
     preferences.end();
     
     // Отправляем ответ
-    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings saved!</h1><p>The device will try to connect to the WiFi network.</p><p>If connection fails, the Access Point will be restarted.</p><p>Redirecting in 5 seconds...</p></body></html>");
+    server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings saved!</h1><p>The device will try to connect to the WiFi network.</p><p>If connection fails, the Access Point will be restarted.</p><p>Redirecting in 5 seconds...</p></body></html>");
     
     // Перезапускаем WiFi
     ap_mode = false;
@@ -396,19 +377,19 @@ void handleSaveWifi(AsyncWebServerRequest *request) {
     delay(1000);
     setupWifi();
   } else {
-    request->send(400, "text/plain", "Missing parameters");
+    server.send(400, "text/plain", "Missing parameters");
   }
 }
 
 // Обработчик сохранения MQTT настроек
-void handleSaveMQTT(AsyncWebServerRequest *request) {
-  if (request->hasParam("mqtt_server", true) && request->hasParam("mqtt_port", true)) {
-    mqtt_enabled = request->hasParam("mqtt_enabled", true);
-    mqtt_server = request->getParam("mqtt_server", true)->value();
-    mqtt_port = request->getParam("mqtt_port", true)->value();
-    mqtt_user = request->getParam("mqtt_user", true)->value();
-    mqtt_password = request->getParam("mqtt_password", true)->value();
-    mqtt_prefix = request->getParam("mqtt_prefix", true)->value();
+void handleSaveMQTT() {
+  if (server.hasArg("mqtt_server") && server.hasArg("mqtt_port")) {
+    mqtt_enabled = server.hasArg("mqtt_enabled");
+    mqtt_server = server.arg("mqtt_server");
+    mqtt_port = server.arg("mqtt_port");
+    mqtt_user = server.arg("mqtt_user");
+    mqtt_password = server.arg("mqtt_password");
+    mqtt_prefix = server.arg("mqtt_prefix");
     
     // Сохраняем настройки
     preferences.begin("mqtt", false);
@@ -421,24 +402,24 @@ void handleSaveMQTT(AsyncWebServerRequest *request) {
     preferences.putString("prefix", mqtt_prefix);
     preferences.end();
     
-    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
+    server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
   } else {
-    request->send(400, "text/plain", "Missing parameters");
+    server.send(400, "text/plain", "Missing parameters");
   }
 }
 
 // Обработчик сброса WiFi настроек
-void handleResetWifi(AsyncWebServerRequest *request) {
-  request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings have been reset!</h1><p>The device will restart as an Access Point.</p><p>Redirecting in 5 seconds...</p></body></html>");
+void handleResetWifi() {
+  server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>WiFi settings have been reset!</h1><p>The device will restart as an Access Point.</p><p>Redirecting in 5 seconds...</p></body></html>");
   delay(1000);
   resetWiFiSettings();
 }
 
 // Обработчик статуса MQTT
-void handleMqttStatus(AsyncWebServerRequest *request) {
+void handleMqttStatus() {
   String status = getMqttStatus();
   String json = "{\"status\":\"" + status + "\"}";
-  request->send(200, "application/json", json);
+  server.send(200, "application/json", json);
 }
 
 // Настройка веб-сервера
@@ -452,30 +433,6 @@ void setupServer() {
   server.on("/reset-wifi", HTTP_POST, handleResetWifi);
   server.on("/mqtt-status", HTTP_GET, handleMqttStatus);
   
-  // Обработчик OTA обновления
-  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
-    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body><h1>Update complete!</h1><p>Device will restart in 5 seconds...</p></body></html>");
-    delay(1000);
-    ESP.restart();
-  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
-    if (!index) {
-      Serial.printf("Update: %s\n", filename.c_str());
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-        Update.printError(Serial);
-      }
-    }
-    if (Update.write(data, len) != len) {
-      Update.printError(Serial);
-    }
-    if (final) {
-      if (Update.end(true)) {
-        Serial.printf("Update Success: %u\nRebooting...\n", index + len);
-      } else {
-        Update.printError(Serial);
-      }
-    }
-  });
-  
   server.begin();
   Serial.println("Web server started");
 }
@@ -484,30 +441,37 @@ void setupServer() {
 void setupOTA() {
   Serial.println("Setting up OTA...");
   
-  ArduinoOTA
-    .onStart([]() {
-      String type;
-      if (ArduinoOTA.getCommand() == U_FLASH)
-        type = "sketch";
-      else
-        type = "filesystem";
-      Serial.println("Start updating " + type);
-    })
-    .onEnd([]() {
-      Serial.println("\nEnd");
-    })
-    .onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    })
-    .onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    });
-
+  // Настраиваем OTA
+  ArduinoOTA.setHostname(deviceName.c_str());
+  ArduinoOTA.setPassword("admin"); // Пароль для OTA
+  
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_SPIFFS
+      type = "filesystem";
+    }
+    Serial.println("Start updating " + type);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  
   ArduinoOTA.begin();
   Serial.println("OTA ready");
 }
@@ -558,14 +522,15 @@ void checkConnections() {
 
 // Обновление состояния светодиода
 void updateLedState() {
+  static unsigned long lastToggle = 0;
   unsigned long currentMillis = millis();
   
   if (isResetting) {
-    // Быстрое мигание во время сброса (каждые 100 мс)
-    if (currentMillis - ledLastToggle > 100) {
+    // Быстрое мигание во время сброса
+    if (currentMillis - lastToggle >= LED_FAST_BLINK) {
       ledState = !ledState;
       digitalWrite(LED_PIN, ledState);
-      ledLastToggle = currentMillis;
+      lastToggle = currentMillis;
     }
   } else if (isConnected) {
     // Постоянно горит при наличии подключения
@@ -574,11 +539,11 @@ void updateLedState() {
       digitalWrite(LED_PIN, HIGH);
     }
   } else {
-    // Медленное мигание при отсутствии подключения (каждые 500 мс)
-    if (currentMillis - ledLastToggle > 500) {
+    // Медленное мигание при отсутствии подключения
+    if (currentMillis - lastToggle >= LED_BLINK_INTERVAL) {
       ledState = !ledState;
       digitalWrite(LED_PIN, ledState);
-      ledLastToggle = currentMillis;
+      lastToggle = currentMillis;
     }
   }
 }
@@ -610,20 +575,20 @@ void loadSettings() {
 
 // Функция для получения тестовых значений сенсоров
 void updateSensorValues() {
-  // Заглушка для тестовых значений
   static unsigned long lastUpdate = 0;
-  const unsigned long UPDATE_INTERVAL = 5000; // 5 секунд
   
-  if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+  if (millis() - lastUpdate >= SENSOR_UPDATE_INTERVAL) {
     lastUpdate = millis();
     
     // Генерируем тестовые значения
     orpValue = 650.0 + random(-10, 10); // ORP в диапазоне 640-660 mV
     phValue = 7.2 + random(-2, 2) * 0.1; // pH в диапазоне 7.0-7.4
     
-    safePrintln("Sensor values updated:");
-    safePrintln("ORP: " + String(orpValue) + " mV");
-    safePrintln("pH: " + String(phValue));
+    if (DEBUG_MODE) {
+      safePrintln("Sensor values updated:");
+      safePrintln("ORP: " + String(orpValue) + " mV");
+      safePrintln("pH: " + String(phValue));
+    }
   }
 }
 
@@ -676,13 +641,19 @@ void setup() {
   Serial.println("Setup completed\n");
 }
 
-// Функция для проверки подключения к WiFi
-bool checkWiFiConnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    safePrintln("WiFi connection lost");
-    return false;
+// Функция для отправки конфигурации сенсора
+bool sendSensorConfig(const String& topic, const String& config) {
+  if (config.length() > 0) {
+    bool configSent = mqttClient.publish(topic.c_str(), (uint8_t*)config.c_str(), config.length(), true);
+    if (configSent) {
+      safePrintln("Config published successfully");
+      return true;
+    } else {
+      safePrintln("Failed to publish config. Error: " + String(mqttClient.state()));
+      return false;
+    }
   }
-  return true;
+  return false;
 }
 
 // Функция для отправки данных в MQTT
@@ -691,18 +662,12 @@ void sendMqttData() {
     safePrintln("MQTT: Not connected, skipping data send");
     return;
   }
-
+  
   // Базовый топик для устройства
   String baseTopic = mqtt_prefix + "/sensor/" + mqtt_client_id;
   
   // Топик для состояния
   String stateTopic = baseTopic + "/state";
-
-  // Конфигурация для ORP сенсора
-  String orpConfigTopic = baseTopic + "/orp/config";
-  
-  // Конфигурация для pH сенсора
-  String phConfigTopic = baseTopic + "/ph/config";
 
   // Получаем MAC адрес для идентификатора устройства
   uint8_t mac[6];
@@ -710,7 +675,7 @@ void sendMqttData() {
   char macStr[18];
   sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-  // Конфигурация ORP сенсора (упрощенная)
+  // Конфигурация ORP сенсора
   String orpConfig = "{\"name\":\"" + deviceName + " ORP\","
                      "\"uniq_id\":\"" + mqtt_client_id + "_orp\","
                      "\"dev_cla\":\"voltage\","
@@ -725,7 +690,7 @@ void sendMqttData() {
                      "\"frc_upd\":true,"
                      "\"exp_aft\":300}";
 
-  // Конфигурация pH сенсора (упрощенная)
+  // Конфигурация pH сенсора
   String phConfig = "{\"name\":\"" + deviceName + " pH\","
                     "\"uniq_id\":\"" + mqtt_client_id + "_ph\","
                     "\"dev_cla\":\"ph\","
@@ -744,49 +709,17 @@ void sendMqttData() {
   safePrintln("\n=== MQTT Configuration ===");
   safePrintln("Base Topic: " + baseTopic);
   safePrintln("State Topic: " + stateTopic);
-  safePrintln("ORP Config Topic: " + orpConfigTopic);
-  safePrintln("pH Config Topic: " + phConfigTopic);
   safePrintln("Device MAC: " + String(macStr));
-  safePrintln("ORP Config: " + orpConfig);
-  safePrintln("pH Config: " + phConfig);
-  safePrintln("========================\n");
 
-  // Проверяем размер сообщений
-  safePrintln("ORP Config size: " + String(orpConfig.length()));
-  safePrintln("pH Config size: " + String(phConfig.length()));
-
-  // Отправляем конфигурацию с retain=true
-  if (orpConfig.length() > 0) {
-    bool orpConfigSent = mqttClient.publish(orpConfigTopic.c_str(), (uint8_t*)orpConfig.c_str(), orpConfig.length(), true);
-    if (orpConfigSent) {
-      safePrintln("ORP config published successfully");
-    } else {
-      safePrintln("Failed to publish ORP config. Error: " + String(mqttClient.state()));
-      safePrintln("MQTT Client state: " + String(mqttClient.state()));
-    }
-  } else {
-    safePrintln("ORP config is empty, skipping publish");
-  }
-
-  // Даем время на отправку первого сообщения
+  // Отправляем конфигурацию ORP
+  sendSensorConfig(baseTopic + "/orp/config", orpConfig);
   delay(200);
 
-  if (phConfig.length() > 0) {
-    bool phConfigSent = mqttClient.publish(phConfigTopic.c_str(), (uint8_t*)phConfig.c_str(), phConfig.length(), true);
-    if (phConfigSent) {
-      safePrintln("pH config published successfully");
-    } else {
-      safePrintln("Failed to publish pH config. Error: " + String(mqttClient.state()));
-      safePrintln("MQTT Client state: " + String(mqttClient.state()));
-    }
-  } else {
-    safePrintln("pH config is empty, skipping publish");
-  }
-
-  // Даем время на отправку второго сообщения
+  // Отправляем конфигурацию pH
+  sendSensorConfig(baseTopic + "/ph/config", phConfig);
   delay(200);
 
-  // Отправляем текущие значения с retain=false
+  // Отправляем текущие значения
   String stateData = "{\"orp\":" + String(orpValue) + ",\"ph\":" + String(phValue) + "}";
   if (stateData.length() > 0) {
     bool stateSent = mqttClient.publish(stateTopic.c_str(), (uint8_t*)stateData.c_str(), stateData.length(), false);
@@ -794,10 +727,7 @@ void sendMqttData() {
       safePrintln("State data published successfully");
     } else {
       safePrintln("Failed to publish state data. Error: " + String(mqttClient.state()));
-      safePrintln("MQTT Client state: " + String(mqttClient.state()));
     }
-  } else {
-    safePrintln("State data is empty, skipping publish");
   }
 }
 
@@ -805,9 +735,6 @@ void sendMqttData() {
 void loop() {
   static unsigned long lastCheck = 0;
   static unsigned long lastMqttSend = 0;
-  const unsigned long CHECK_INTERVAL = 100; // 100ms
-  const unsigned long MQTT_SEND_INTERVAL = 60000; // 60 секунд
-  
   unsigned long now = millis();
   
   // Периодические проверки
@@ -843,7 +770,10 @@ void loop() {
     dnsServer.processNextRequest();
   }
   
-  // Обработка OTA (только в режиме клиента)
+  // Обработка веб-сервера
+  server.handleClient();
+  
+  // Обработка OTA обновлений
   if (!ap_mode) {
     ArduinoOTA.handle();
   }
