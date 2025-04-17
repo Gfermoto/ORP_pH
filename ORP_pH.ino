@@ -30,7 +30,7 @@ String mqtt_server = "";  // Адрес MQTT сервера
 String mqtt_port = "1883"; // Порт MQTT сервера
 String mqtt_user = "";    // Имя пользователя MQTT
 String mqtt_password = ""; // Пароль MQTT
-String mqtt_topic = "homeassistant/sensor/orp_ph"; // Топик MQTT для Home Assistant
+String mqtt_prefix = "homeassistant"; // Базовый префикс для MQTT топиков
 bool mqtt_enabled = false; // Включен ли MQTT
 String mqtt_client_id = ""; // ID клиента MQTT (будет установлен как имя устройства)
 
@@ -50,26 +50,83 @@ const unsigned long WATCHDOG_TIMEOUT = 30000; // 30 секунд
 // Объявление функции debugPrint
 void debugPrint(const String& message);
 
+// Функция для безопасного вывода в Serial
+void safePrintln(const String& message) {
+  static bool serialInitialized = false;
+  
+  if (!serialInitialized) {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.flush();
+    serialInitialized = true;
+  }
+  
+  if (Serial) {
+    Serial.println(message);
+    delay(10); // Даем время на отправку
+  }
+}
+
+void safePrint(const String& message) {
+  static bool serialInitialized = false;
+  
+  if (!serialInitialized) {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.flush();
+    serialInitialized = true;
+  }
+  
+  if (Serial) {
+    Serial.print(message);
+    delay(10); // Даем время на отправку
+  }
+}
+
+// Функция для формирования MQTT топиков
+String getMqttTopic(const String& type, const String& name = "") {
+  String topic = mqtt_prefix;
+  if (type == "status") {
+    topic += "/status";
+  } else if (type == "sensor") {
+    topic += "/sensor/orp_ph";
+    if (name != "") {
+      topic += "/" + name;
+    }
+  }
+  return topic;
+}
+
 // Функция для подключения к MQTT
 bool connectToMQTT() {
   if (!mqtt_enabled) {
+    safePrintln("MQTT: Not enabled");
     return false;
   }
   
+  safePrintln("\n=== Connecting to MQTT ===");
+  safePrintln("Server: " + mqtt_server);
+  safePrintln("Port:   " + mqtt_port);
+  safePrintln("Client: " + mqtt_client_id);
+  safePrintln("=======================\n");
+  
   // Устанавливаем LWT
-  String lwtTopic = mqtt_topic;
-  if (!lwtTopic.endsWith("/")) {
-    lwtTopic += "/";
-  }
-  lwtTopic += "availability";
+  String lwtTopic = mqtt_client_id + "/status";
   
   if (mqttClient.connect(mqtt_client_id.c_str(), mqtt_user.c_str(), mqtt_password.c_str(), lwtTopic.c_str(), 0, true, "offline")) {
+    safePrintln("MQTT: Connected successfully");
+    
+    // Отправляем статус online
+    mqttClient.publish(lwtTopic.c_str(), "online", true);
+    
     // После успешного подключения отправляем конфигурацию
     sendMqttData();
     return true;
+  } else {
+    safePrintln("MQTT: Connection failed");
+    safePrintln("State: " + String(mqttClient.state()));
+    return false;
   }
-  
-  return false;
 }
 
 // Функция для проверки состояния MQTT
@@ -130,7 +187,7 @@ void saveSettings() {
   preferences.putString("port", mqtt_port);
   preferences.putString("user", mqtt_user);
   preferences.putString("password", mqtt_password);
-  preferences.putString("topic", mqtt_topic);
+  preferences.putString("prefix", mqtt_prefix);
   preferences.end();
   
   Serial.println("Settings saved successfully");
@@ -231,8 +288,8 @@ String getAPConfigPage() {
     html += "<input type='text' name='mqtt_user' value='" + mqtt_user + "'>";
     html += "<label for='mqtt_password'>MQTT Password:</label>";
     html += "<input type='password' name='mqtt_password' value='" + mqtt_password + "'>";
-    html += "<label for='mqtt_topic'>MQTT Topic:</label>";
-    html += "<input type='text' name='mqtt_topic' value='" + mqtt_topic + "'>";
+    html += "<label for='mqtt_prefix'>MQTT Prefix:</label>";
+    html += "<input type='text' name='mqtt_prefix' value='" + mqtt_prefix + "'>";
     html += "<input type='submit' value='Save MQTT Settings'>";
     html += "</form>";
     html += "</div>";
@@ -362,14 +419,14 @@ void handleSaveMQTT() {
   mqtt_port = server.arg("mqtt_port");
   mqtt_user = server.arg("mqtt_user");
   mqtt_password = server.arg("mqtt_password");
-  mqtt_topic = server.arg("mqtt_topic");
+  mqtt_prefix = server.arg("mqtt_prefix");
   
   Serial.println("Saving MQTT settings:");
   Serial.println("Enabled: " + String(mqtt_enabled ? "true" : "false"));
   Serial.println("Server: " + mqtt_server);
   Serial.println("Port: " + mqtt_port);
   Serial.println("User: " + mqtt_user);
-  Serial.println("Topic: " + mqtt_topic);
+  Serial.println("Prefix: " + mqtt_prefix);
   
   // Сохраняем в энергонезависимую память
   preferences.begin("mqtt", false);
@@ -379,7 +436,7 @@ void handleSaveMQTT() {
   preferences.putString("port", mqtt_port);
   preferences.putString("user", mqtt_user);
   preferences.putString("password", mqtt_password);
-  preferences.putString("topic", mqtt_topic.isEmpty() ? "homeassistant/sensor/orp_ph" : mqtt_topic);
+  preferences.putString("prefix", mqtt_prefix);
   preferences.end();
   
   Serial.println("MQTT settings saved to NVS");
@@ -439,7 +496,7 @@ void setupWifi() {
   mqtt_port = preferences.getString("port", "1883");
   mqtt_user = preferences.getString("user", "");
   mqtt_password = preferences.getString("password", "");
-  mqtt_topic = preferences.getString("topic", "homeassistant/sensor/orp_ph");
+  mqtt_prefix = preferences.getString("prefix", "homeassistant");
   preferences.end();
   
   // Получаем MAC адрес и формируем имя устройства, если еще не сформировано
@@ -578,7 +635,7 @@ void setupServer() {
       mqtt_port = server.arg("mqtt_port");
       mqtt_user = server.arg("mqtt_user");
       mqtt_password = server.arg("mqtt_password");
-      mqtt_topic = server.arg("mqtt_topic");
+      mqtt_prefix = server.arg("mqtt_prefix");
       
       // Сохраняем настройки
       preferences.begin("mqtt", false);
@@ -588,7 +645,7 @@ void setupServer() {
       preferences.putString("port", mqtt_port);
       preferences.putString("user", mqtt_user);
       preferences.putString("password", mqtt_password);
-      preferences.putString("topic", mqtt_topic.isEmpty() ? "homeassistant/sensor/orp_ph" : mqtt_topic);
+      preferences.putString("prefix", mqtt_prefix);
       preferences.end();
       
       server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='3;url=/'></head><body><h1>MQTT settings saved!</h1><p>Redirecting in 3 seconds...</p></body></html>");
@@ -730,29 +787,27 @@ void loadSettings() {
   mqtt_port = preferences.getString("port", "1883");
   mqtt_user = preferences.getString("user", "");
   mqtt_password = preferences.getString("password", "");
-  mqtt_topic = preferences.getString("topic", "homeassistant/sensor/orp_ph");
+  mqtt_prefix = preferences.getString("prefix", "homeassistant");
   preferences.end();
   
   Serial.println("Settings loaded successfully");
+  Serial.println("MQTT Prefix: " + mqtt_prefix);
 }
 
 // Улучшенная функция setup
 void setup() {
   // Инициализация последовательного порта
   Serial.begin(115200);
-  Serial.setTimeout(100); // Устанавливаем таймаут чтения
-  Serial.flush(); // Очищаем буфер
+  delay(1000);
   
   // Ждем инициализации порта
   while (!Serial) {
     delay(10);
   }
   
-  // Даем время на стабилизацию
-  delay(1000);
-  
-  Serial.println("\n=== ESP32 ORP/pH Device ===");
+  Serial.println("\n\n=== ESP32 ORP/pH Device ===");
   Serial.println("Version: " + String(VERSION));
+  Serial.println("===========================\n");
   
   // Инициализация GPIO
   pinMode(BOOT_BUTTON, INPUT);
@@ -784,7 +839,7 @@ void setup() {
     connectToMQTT();
   }
   
-  Serial.println("Setup completed");
+  Serial.println("Setup completed\n");
 }
 
 // Функция для проверки подключения к WiFi
@@ -806,58 +861,59 @@ void handleMqttStatus() {
 // Функция для отправки данных в MQTT
 void sendMqttData() {
   if (!mqtt_enabled || !mqttClient.connected()) {
+    Serial.println("MQTT: Not enabled or not connected");
     return;
   }
   
   // Формируем базовый топик
-  String baseTopic = mqtt_topic;
+  String baseTopic = mqtt_prefix;
   if (!baseTopic.endsWith("/")) {
     baseTopic += "/";
   }
   
   // Топики для устройства
-  String configTopic = baseTopic + "config";
-  String availabilityTopic = baseTopic + "availability";
+  String configTopic = baseTopic + "sensor/" + mqtt_client_id;
+  String stateTopic = baseTopic + mqtt_client_id + "/state";
   
-  // Отправляем статус доступности
-  mqttClient.publish(availabilityTopic.c_str(), "online", true);
+  Serial.println("MQTT: Using topics:");
+  Serial.println("Config: " + configTopic);
+  Serial.println("State: " + stateTopic);
   
-  // Формируем JSON для конфигурации устройства
-  String configJson = "{";
-  configJson += "\"name\":\"" + deviceName + "\",";
-  configJson += "\"availability_topic\":\"" + availabilityTopic + "\",";
-  configJson += "\"device\":{";
-  configJson += "\"identifiers\":[\"" + mqtt_client_id + "\"],";
-  configJson += "\"name\":\"" + deviceName + "\",";
-  configJson += "\"manufacturer\":\"Eyera\",";
-  configJson += "\"model\":\"ORP/pH Sensor\",";
-  configJson += "\"sw_version\":\"" + String(VERSION) + "\"";
-  configJson += "},";
+  // Формируем JSON для конфигурации ORP сенсора
+  String orpConfigJson = "{";
+  orpConfigJson += "\"name\":\"" + deviceName + " ORP\",";
+  orpConfigJson += "\"unique_id\":\"" + mqtt_client_id + "_orp\",";
+  orpConfigJson += "\"device_class\":\"voltage\",";
+  orpConfigJson += "\"dev\":{\"ids\":[\"" + mqtt_client_id + "\"]},";
+  orpConfigJson += "\"~\":\"" + mqtt_client_id + "\",";
+  orpConfigJson += "\"stat_t\":\"~/state\",";
+  orpConfigJson += "\"val_tpl\":\"{{value_json.orp}}\",";
+  orpConfigJson += "\"unit_of_measurement\":\"mV\"";
+  orpConfigJson += "}";
   
-  // Добавляем ORP сенсор
-  configJson += "\"orp\":{";
-  configJson += "\"name\":\"ORP\",";
-  configJson += "\"device_class\":\"voltage\",";
-  configJson += "\"state_topic\":\"" + baseTopic + "state\",";
-  configJson += "\"value_template\":\"{{ value_json.orp }}\",";
-  configJson += "\"unit_of_measurement\":\"mV\",";
-  configJson += "\"unique_id\":\"" + mqtt_client_id + "_orp\"";
-  configJson += "},";
+  // Формируем JSON для конфигурации pH сенсора
+  String phConfigJson = "{";
+  phConfigJson += "\"name\":\"" + deviceName + " pH\",";
+  phConfigJson += "\"unique_id\":\"" + mqtt_client_id + "_ph\",";
+  phConfigJson += "\"device_class\":\"ph\",";
+  phConfigJson += "\"dev\":{\"ids\":[\"" + mqtt_client_id + "\"]},";
+  phConfigJson += "\"~\":\"" + mqtt_client_id + "\",";
+  phConfigJson += "\"stat_t\":\"~/state\",";
+  phConfigJson += "\"val_tpl\":\"{{value_json.ph}}\",";
+  phConfigJson += "\"unit_of_measurement\":\"pH\"";
+  phConfigJson += "}";
   
-  // Добавляем pH сенсор
-  configJson += "\"ph\":{";
-  configJson += "\"name\":\"pH\",";
-  configJson += "\"device_class\":\"ph\",";
-  configJson += "\"state_topic\":\"" + baseTopic + "state\",";
-  configJson += "\"value_template\":\"{{ value_json.ph }}\",";
-  configJson += "\"unit_of_measurement\":\"pH\",";
-  configJson += "\"unique_id\":\"" + mqtt_client_id + "_ph\"";
-  configJson += "}";
+  // Отправляем конфигурации
+  Serial.println("MQTT: Sending ORP configuration");
+  mqttClient.publish((configTopic + "_orp/config").c_str(), orpConfigJson.c_str(), true);
   
-  configJson += "}";
+  Serial.println("MQTT: Sending pH configuration");
+  mqttClient.publish((configTopic + "_ph/config").c_str(), phConfigJson.c_str(), true);
   
-  // Отправляем только конфигурацию
-  mqttClient.publish(configTopic.c_str(), configJson.c_str(), true);
+  // Отправляем тестовые данные
+  String stateJson = "{\"orp\": 650, \"ph\": 7.2}";
+  Serial.println("MQTT: Sending state data");
+  mqttClient.publish(stateTopic.c_str(), stateJson.c_str());
 }
 
 // Модифицируем функцию loop
