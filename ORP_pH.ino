@@ -13,7 +13,7 @@
 #define DNS_PORT    53  // Порт DNS сервера
 #define DEBUG_MODE false // Режим отладки
 const char* DEVICE_PREFIX = "ORP_pH_"; // Префикс имени устройства
-const char* VERSION = "v1.2.0"; // Версия прошивки
+const char* VERSION = "v1.2.1a"; // Версия прошивки
 
 // Объекты для работы
 WebServer server(80);
@@ -47,8 +47,15 @@ unsigned long ledLastToggle = 0; // Время последнего перекл
 static unsigned long lastReset = 0;
 const unsigned long WATCHDOG_TIMEOUT = 30000; // 30 секунд
 
+// Переменные для хранения значений сенсоров
+float orpValue = 0.0;  // Значение ORP в mV
+float phValue = 0.0;   // Значение pH
+
 // Объявление функции debugPrint
 void debugPrint(const String& message);
+
+// В начале файла, после объявления mqttClient
+#define MQTT_MAX_PACKET_SIZE 512  // Увеличиваем размер буфера MQTT
 
 // Функция для безопасного вывода в Serial
 void safePrintln(const String& message) {
@@ -110,10 +117,10 @@ bool connectToMQTT() {
   safePrintln("Client: " + mqtt_client_id);
   safePrintln("=======================\n");
   
-  // Устанавливаем LWT
-  String lwtTopic = mqtt_client_id + "/status";
+  // Устанавливаем LWT с правильной структурой топика
+  String lwtTopic = mqtt_prefix + "/sensor/" + mqtt_client_id + "/availability";
   
-  if (mqttClient.connect(mqtt_client_id.c_str(), mqtt_user.c_str(), mqtt_password.c_str(), lwtTopic.c_str(), 0, true, "offline")) {
+  if (mqttClient.connect(mqtt_client_id.c_str(), mqtt_user.c_str(), mqtt_password.c_str(), lwtTopic.c_str(), 1, true, "offline")) {
     safePrintln("MQTT: Connected successfully");
     
     // Отправляем статус online
@@ -794,6 +801,25 @@ void loadSettings() {
   Serial.println("MQTT Prefix: " + mqtt_prefix);
 }
 
+// Функция для получения тестовых значений сенсоров
+void updateSensorValues() {
+  // Заглушка для тестовых значений
+  static unsigned long lastUpdate = 0;
+  const unsigned long UPDATE_INTERVAL = 5000; // 5 секунд
+  
+  if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+    lastUpdate = millis();
+    
+    // Генерируем тестовые значения
+    orpValue = 650.0 + random(-10, 10); // ORP в диапазоне 640-660 mV
+    phValue = 7.2 + random(-2, 2) * 0.1; // pH в диапазоне 7.0-7.4
+    
+    safePrintln("Sensor values updated:");
+    safePrintln("ORP: " + String(orpValue) + " mV");
+    safePrintln("pH: " + String(phValue));
+  }
+}
+
 // Улучшенная функция setup
 void setup() {
   // Инициализация последовательного порта
@@ -833,6 +859,7 @@ void setup() {
   
   // Настройка MQTT клиента
   mqttClient.setServer(mqtt_server.c_str(), atoi(mqtt_port.c_str()));
+  mqttClient.setBufferSize(MQTT_MAX_PACKET_SIZE);  // Устанавливаем размер буфера
   
   // Пробуем подключиться к MQTT
   if (mqtt_enabled) {
@@ -860,60 +887,118 @@ void handleMqttStatus() {
 
 // Функция для отправки данных в MQTT
 void sendMqttData() {
-  if (!mqtt_enabled || !mqttClient.connected()) {
-    Serial.println("MQTT: Not enabled or not connected");
+  if (!mqttClient.connected()) {
+    safePrintln("MQTT: Not connected, skipping data send");
     return;
   }
+
+  // Базовый топик для устройства
+  String baseTopic = mqtt_prefix + "/sensor/" + mqtt_client_id;
   
-  // Формируем базовый топик
-  String baseTopic = mqtt_prefix;
-  if (!baseTopic.endsWith("/")) {
-    baseTopic += "/";
+  // Топик для состояния
+  String stateTopic = baseTopic + "/state";
+
+  // Конфигурация для ORP сенсора
+  String orpConfigTopic = baseTopic + "/orp/config";
+  
+  // Конфигурация для pH сенсора
+  String phConfigTopic = baseTopic + "/ph/config";
+
+  // Получаем MAC адрес для идентификатора устройства
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[18];
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  // Конфигурация ORP сенсора (упрощенная)
+  String orpConfig = "{\"name\":\"" + deviceName + " ORP\","
+                     "\"uniq_id\":\"" + mqtt_client_id + "_orp\","
+                     "\"dev_cla\":\"voltage\","
+                     "\"stat_cla\":\"measurement\","
+                     "\"unit_of_meas\":\"mV\","
+                     "\"dev\":{\"ids\":[\"" + String(macStr) + "\"],"
+                             "\"name\":\"" + deviceName + "\","
+                             "\"mf\":\"eyera\","
+                             "\"mdl\":\"orp_ph\"},"
+                     "\"stat_t\":\"" + stateTopic + "\","
+                     "\"val_tpl\":\"{{ value_json.orp }}\","
+                     "\"frc_upd\":true,"
+                     "\"exp_aft\":300}";
+
+  // Конфигурация pH сенсора (упрощенная)
+  String phConfig = "{\"name\":\"" + deviceName + " pH\","
+                    "\"uniq_id\":\"" + mqtt_client_id + "_ph\","
+                    "\"dev_cla\":\"ph\","
+                    "\"stat_cla\":\"measurement\","
+                    "\"unit_of_meas\":\"pH\","
+                    "\"dev\":{\"ids\":[\"" + String(macStr) + "\"],"
+                            "\"name\":\"" + deviceName + "\","
+                            "\"mf\":\"eyera\","
+                            "\"mdl\":\"orp_ph\"},"
+                    "\"stat_t\":\"" + stateTopic + "\","
+                    "\"val_tpl\":\"{{ value_json.ph }}\","
+                    "\"frc_upd\":true,"
+                    "\"exp_aft\":300}";
+
+  // Выводим отладочную информацию
+  safePrintln("\n=== MQTT Configuration ===");
+  safePrintln("Base Topic: " + baseTopic);
+  safePrintln("State Topic: " + stateTopic);
+  safePrintln("ORP Config Topic: " + orpConfigTopic);
+  safePrintln("pH Config Topic: " + phConfigTopic);
+  safePrintln("Device MAC: " + String(macStr));
+  safePrintln("ORP Config: " + orpConfig);
+  safePrintln("pH Config: " + phConfig);
+  safePrintln("========================\n");
+
+  // Проверяем размер сообщений
+  safePrintln("ORP Config size: " + String(orpConfig.length()));
+  safePrintln("pH Config size: " + String(phConfig.length()));
+
+  // Отправляем конфигурацию с retain=true
+  if (orpConfig.length() > 0) {
+    bool orpConfigSent = mqttClient.publish(orpConfigTopic.c_str(), (uint8_t*)orpConfig.c_str(), orpConfig.length(), true);
+    if (orpConfigSent) {
+      safePrintln("ORP config published successfully");
+    } else {
+      safePrintln("Failed to publish ORP config. Error: " + String(mqttClient.state()));
+      safePrintln("MQTT Client state: " + String(mqttClient.state()));
+    }
+  } else {
+    safePrintln("ORP config is empty, skipping publish");
   }
-  
-  // Топики для устройства
-  String configTopic = baseTopic + "sensor/" + mqtt_client_id;
-  String stateTopic = baseTopic + mqtt_client_id + "/state";
-  
-  Serial.println("MQTT: Using topics:");
-  Serial.println("Config: " + configTopic);
-  Serial.println("State: " + stateTopic);
-  
-  // Формируем JSON для конфигурации ORP сенсора
-  String orpConfigJson = "{";
-  orpConfigJson += "\"name\":\"" + deviceName + " ORP\",";
-  orpConfigJson += "\"unique_id\":\"" + mqtt_client_id + "_orp\",";
-  orpConfigJson += "\"device_class\":\"voltage\",";
-  orpConfigJson += "\"dev\":{\"ids\":[\"" + mqtt_client_id + "\"]},";
-  orpConfigJson += "\"~\":\"" + mqtt_client_id + "\",";
-  orpConfigJson += "\"stat_t\":\"~/state\",";
-  orpConfigJson += "\"val_tpl\":\"{{value_json.orp}}\",";
-  orpConfigJson += "\"unit_of_measurement\":\"mV\"";
-  orpConfigJson += "}";
-  
-  // Формируем JSON для конфигурации pH сенсора
-  String phConfigJson = "{";
-  phConfigJson += "\"name\":\"" + deviceName + " pH\",";
-  phConfigJson += "\"unique_id\":\"" + mqtt_client_id + "_ph\",";
-  phConfigJson += "\"device_class\":\"ph\",";
-  phConfigJson += "\"dev\":{\"ids\":[\"" + mqtt_client_id + "\"]},";
-  phConfigJson += "\"~\":\"" + mqtt_client_id + "\",";
-  phConfigJson += "\"stat_t\":\"~/state\",";
-  phConfigJson += "\"val_tpl\":\"{{value_json.ph}}\",";
-  phConfigJson += "\"unit_of_measurement\":\"pH\"";
-  phConfigJson += "}";
-  
-  // Отправляем конфигурации
-  Serial.println("MQTT: Sending ORP configuration");
-  mqttClient.publish((configTopic + "_orp/config").c_str(), orpConfigJson.c_str(), true);
-  
-  Serial.println("MQTT: Sending pH configuration");
-  mqttClient.publish((configTopic + "_ph/config").c_str(), phConfigJson.c_str(), true);
-  
-  // Отправляем тестовые данные
-  String stateJson = "{\"orp\": 650, \"ph\": 7.2}";
-  Serial.println("MQTT: Sending state data");
-  mqttClient.publish(stateTopic.c_str(), stateJson.c_str());
+
+  // Даем время на отправку первого сообщения
+  delay(200);
+
+  if (phConfig.length() > 0) {
+    bool phConfigSent = mqttClient.publish(phConfigTopic.c_str(), (uint8_t*)phConfig.c_str(), phConfig.length(), true);
+    if (phConfigSent) {
+      safePrintln("pH config published successfully");
+    } else {
+      safePrintln("Failed to publish pH config. Error: " + String(mqttClient.state()));
+      safePrintln("MQTT Client state: " + String(mqttClient.state()));
+    }
+  } else {
+    safePrintln("pH config is empty, skipping publish");
+  }
+
+  // Даем время на отправку второго сообщения
+  delay(200);
+
+  // Отправляем текущие значения с retain=false
+  String stateData = "{\"orp\":" + String(orpValue) + ",\"ph\":" + String(phValue) + "}";
+  if (stateData.length() > 0) {
+    bool stateSent = mqttClient.publish(stateTopic.c_str(), (uint8_t*)stateData.c_str(), stateData.length(), false);
+    if (stateSent) {
+      safePrintln("State data published successfully");
+    } else {
+      safePrintln("Failed to publish state data. Error: " + String(mqttClient.state()));
+      safePrintln("MQTT Client state: " + String(mqttClient.state()));
+    }
+  } else {
+    safePrintln("State data is empty, skipping publish");
+  }
 }
 
 // Модифицируем функцию loop
@@ -928,6 +1013,9 @@ void loop() {
   // Периодические проверки
   if (now - lastCheck >= CHECK_INTERVAL) {
     lastCheck = now;
+    
+    // Обновляем значения сенсоров
+    updateSensorValues();
     
     // Проверка подключений
     checkConnections();
